@@ -28,11 +28,21 @@ h2r_il/
 
 Wrap the pipeline plumbing so both models train end-to-end in one env:
 
-- [ ] uv environment; add `lerobot` submodule pinned to a commit, editable install with the `[groot]` (+ training) extras
-- [ ] Dummy fine-tune wrappers: short smoke-test runs (small `--steps`, small batch) for both `--policy.type=pi0` and `--policy.type=groot` on a small public LeRobot-format dataset (e.g. a LIBERO suite subset)
-- [ ] Verify checkpoint save/load for both
+- [x] uv environment (Python 3.12, torch cu128); `lerobot` submodule pinned to v0.6.0, editable install with `[pi,groot,training]` extras
+- [x] Fine-tune wrappers: `scripts/ft_pi0.sh` (from `lerobot/pi0_base` via `--policy.path`) and `scripts/ft_groot.sh` (`--policy.type=groot`, base `nvidia/GR00T-N1.7-3B`, `embodiment_tag=new_embodiment`); `scripts/smoke_test.sh` runs both for a few steps on `lerobot/svla_so101_pickplace`
+- [x] Verify checkpoint save/load for both
 
-**Exit criterion:** both models complete N training steps in the same environment, dataset untouched on disk.
+**Exit criterion (met):** both models complete training steps in the same environment, dataset untouched on disk.
+
+Notes from the smoke runs:
+
+- pi0_base expects openpi camera names (`base_0_rgb`, `left_wrist_0_rgb`, `right_wrist_0_rgb`); datasets with other camera keys need `--rename_map`. LeRobot accepts either-direction subsets between dataset and policy cameras. GR00T with `embodiment_tag=new_embodiment` adapts to any camera set — no rename needed.
+- ~35 GB GPU memory per model at batch size 2, bf16 — plenty of headroom on 96 GB cards for real batch sizes.
+
+## Storage layout (this machine)
+
+- HF cache (models + datasets) lives on `/mnt/shared_data/hf_cache`, symlinked from `~/.cache/huggingface` (root disk is nearly full).
+- `outputs/` is a symlink to `/mnt/shared_data/h2r_il/outputs` (checkpoints are ~20 GB each incl. optimizer state).
 
 ### Phase 1 — annotation-driven frame manipulation
 
