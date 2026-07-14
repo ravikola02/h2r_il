@@ -5,6 +5,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# Optional per-dataset config (e.g. CONFIG=configs/gear_left.env) setting
+# DATASET, DATASET_ROOT, ... (PI0_RENAME_MAP is ignored here: groot's
+# new_embodiment adopts the dataset's camera keys directly.)
+if [[ -n "${CONFIG:-}" ]]; then source "$CONFIG"; fi
+
 DATASET=${DATASET:-lerobot/svla_so101_pickplace}
 BASE_MODEL=${BASE_MODEL:-nvidia/GR00T-N1.7-3B}
 EMBODIMENT_TAG=${EMBODIMENT_TAG:-new_embodiment}
@@ -13,6 +18,9 @@ OUTPUT_DIR=${OUTPUT_DIR:-outputs/$JOB_NAME}
 STEPS=${STEPS:-20000}
 BATCH_SIZE=${BATCH_SIZE:-32}
 WANDB=${WANDB:-false}
+
+EXTRA_ARGS=()
+[[ -n "${DATASET_ROOT:-}" ]] && EXTRA_ARGS+=(--dataset.root="$DATASET_ROOT")
 
 exec uv run lerobot-train \
     --dataset.repo_id="$DATASET" \
@@ -26,4 +34,5 @@ exec uv run lerobot-train \
     --output_dir="$OUTPUT_DIR" \
     --job_name="$JOB_NAME" \
     --wandb.enable="$WANDB" \
+    "${EXTRA_ARGS[@]}" \
     "$@"
