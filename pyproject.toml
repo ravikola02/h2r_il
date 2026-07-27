@@ -5,6 +5,8 @@ description = "Imitation learning from annotated human demonstrations — pipeli
 requires-python = ">=3.12"
 dependencies = [
     "lerobot[pi,groot,training]",
+    "simple-lama-inpainting>=0.1.0",
+    "matplotlib>=3.8",
 ]
 
 [build-system]

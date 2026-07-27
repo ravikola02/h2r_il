@@ -46,8 +46,59 @@ Notes from the smoke runs:
 
 ### Phase 1 — annotation-driven frame manipulation
 
-- Custom transform classes that consume per-frame annotations (masks etc.) and apply them at dataloader time via LeRobot's image-transforms pipeline
-- Visual verification tooling: dump original vs. transformed frames side by side (to `outputs/`, never into the dataset)
+**Visual methods framework** (`src/h2r_il/transforms/`). A *visual method* is a cache-backed, per-frame image manipulation. `VisualMethod` (base) handles tensor⇄numpy conversion (uint8/float, CHW/`(T,C,H,W)`, RGB), a content-addressed disk cache, and a registry; subclasses implement `apply(rgb_uint8) -> rgb_uint8`. New methods self-register with `@register_visual_method("name")` and are immediately usable everywhere.
+
+**Injection into training.** LeRobot's `--dataset.image_transforms` config only accepts torchvision-v2 augmentations, so a custom class can't be named there. Instead we use LeRobot's own extension point — `LeRobotDataset.set_image_transforms` — from a thin wrapper (`h2r_il.train`) that never forks LeRobot: the raw frame flows through our methods first (deterministic, cached), then any photometric augmentation. The dataset on disk is never touched.
+
+```bash
+# Fine-tune with arm inpainting active (works with ft_pi0.sh too):
+CONFIG=configs/gear_left.env VISUAL_METHODS=arm_inpaint ./scripts/ft_groot.sh
+```
+
+**Arm inpainting** (`arm_inpaint`, replicating [HumanEgo](https://github.com/TX-Leo/HumanEgo)): Grounding DINO (`"arm. hand."`) → SAM2 mask → dilate → LaMa inpaint, removing the demonstrator's arm/hand while keeping the manipulated object. Grounding DINO + SAM2 come from `transformers`; LaMa is `simple-lama-inpainting`. Models load lazily only on a cache miss.
+
+**Test / visualization tooling** (`scripts/viz_visual_methods.py`). Dumps original vs. each method's intermediates and result side by side (to `outputs/`, never into the dataset), for any registered method. Also warms the cache so training-time DataLoader workers just read cached frames.
+
+```bash
+# Inspect arm inpainting on a few frames (all cameras):
+uv run python scripts/viz_visual_methods.py \
+    --dataset ravioli02/gear_left \
+    --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \
+    --methods arm_inpaint --num-frames 6
+
+# Render an original|result mp4 over a consecutive clip (one per method+camera):
+uv run python scripts/viz_visual_methods.py \
+    --dataset ravioli02/gear_left \
+    --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \
+    --methods arm_inpaint --cameras observation.images.head \
+    --video --start-index 60 --num-frames 60 --fps 12
+
+# Tune the arm_inpaint knobs from the CLI (see --help for all):
+uv run python scripts/viz_visual_methods.py \
+    --dataset ravioli02/gear_left \
+    --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \
+    --methods arm_inpaint --num-frames 6 \
+    --box-threshold 0.2 --dilation 25 --prompt "arm. hand."
+```
+
+The same knobs carry into training via the `VISUAL_METHODS` JSON spec, e.g.
+`VISUAL_METHODS='[{"name":"arm_inpaint","box_threshold":0.2,"dilation":25}]'`.
+
+```bash
+# Warm the whole-dataset cache before a training run (recommended).
+# ~20k frames (6704 x 3 cams) at ~0.65 s/frame ~= 4-5 h on one GPU; split
+# across both GPUs to ~halve it (content-addressed cache = safe to share):
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/viz_visual_methods.py \
+    --dataset ravioli02/gear_left --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \
+    --methods arm_inpaint --num-frames -1 --fill-cache --no-panels \
+    --num-shards 2 --shard 0 &
+CUDA_VISIBLE_DEVICES=1 uv run python scripts/viz_visual_methods.py \
+    --dataset ravioli02/gear_left --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \
+    --methods arm_inpaint --num-frames -1 --fill-cache --no-panels \
+    --num-shards 2 --shard 1 &
+```
+
+> **Cache before training.** The models are too heavy to run inside DataLoader workers per frame (CUDA-in-forked-worker also breaks). Warm the content-addressed cache with `--fill-cache` first; then training reads cached frames (no model load, no GPU contention). The warm streams frame-by-frame (low RAM) and prints progress/ETA. The dataset stays read-only — the cache lives under `H2R_VISUAL_CACHE` (default `outputs/visual_cache`).
 
 ### Phase 2 — auxiliary losses
 
