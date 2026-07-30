@@ -16,9 +16,9 @@ same frames: it round-trips to ~1e-7 rad.
 
 Usage:
   uv run python scripts/eval_openloop.py \
-      --checkpoint outputs/groot_20260716_133333/checkpoints/020000/pretrained_model \
-      --dataset /mnt/shared_data/datasets/h2r_val/lerobot_datasets/h2r_val/pick_cube_eef_optical \
-      --episodes 14 15 19 --out outputs/validation/groot_20260716_133333__pick_cube
+      --checkpoint outputs/<job>/checkpoints/020000/pretrained_model \
+      --dataset <path to the validation export> \
+      --episodes 14 15 19 --out outputs/validation/<job>__pick_cube
 """
 
 import argparse
@@ -91,20 +91,13 @@ def signed_err(pred: np.ndarray, gt: np.ndarray) -> np.ndarray:
     return err
 
 
-def resample_chunk(action: np.ndarray, s: int, chunk: int, k: float) -> np.ndarray:
-    """The chunk the policy was *trained* to emit at start frame s.
+def gt_chunk(action: np.ndarray, s: int, chunk: int) -> np.ndarray:
+    """The recorded action chunk at start frame s, as-is.
 
-    ACTION_SLOWDOWN=k trains the policy to emit `chunk` actions covering only
-    (chunk-1)/k frames of the demo, so the target is the recorded action
-    sequence sampled at offsets s, s+1/k, ..., s+(chunk-1)/k. k=1 is the raw
-    recorded chunk. Euler dims are unwrapped before interpolation so a +-pi
-    crossing is not blended the long way round (mirrors ActionSlowdown).
+    Past the end of the episode the last recorded action is repeated, so a chunk
+    that runs off the end still scores against something meaningful.
     """
-    src = action.copy()
-    src[:, ANGLE_DIMS] = np.unwrap(src[:, ANGLE_DIMS], axis=0)
-    off = np.clip(s + np.arange(chunk) / k, 0, len(src) - 1)
-    idx = np.arange(len(src))
-    return np.stack([np.interp(off, idx, src[:, d]) for d in range(src.shape[1])], axis=1)
+    return action[np.clip(s + np.arange(chunk), 0, len(action) - 1)]
 
 
 def load_episode(root: Path, ep: int, layout: str):
@@ -131,16 +124,6 @@ def main():
         "deployment would re-plan rather than run all chunk_size steps. Defaults to the full "
         "chunk_size. The policy is unchanged: it still predicts the whole chunk, the tail is "
         "just dropped before scoring.",
-    )
-    p.add_argument(
-        "--slowdown",
-        type=float,
-        default=4.0,
-        help="ACTION_SLOWDOWN factor the checkpoint was trained with; the GT chunk is "
-        "resampled to 1/k speed to match what the policy was trained to emit. The "
-        "training run is not recorded in train_config.json, so this must be supplied. "
-        "groot_20260716_133333 was trained at k=4 (configs/gear_left.env), confirmed by "
-        "an MAE sweep over k on held-in data. Use 1 for a policy trained without slowdown.",
     )
     p.add_argument("--task", default=None, help="override language instruction")
     p.add_argument(
@@ -183,9 +166,9 @@ def main():
         df, state, action = load_episode(root, ep, args.state_layout)
         T = len(df)
         task = args.task if args.task is not None else tasks[int(df["task_index"].iloc[0])]
-        # the kept prefix spans (n_steps-1)/k frames of the demo, so start points
+        # the kept prefix spans n_steps-1 frames of the demo, so start points
         # only need to stop that far from the end.
-        span = int(np.ceil((n_steps - 1) / args.slowdown))
+        span = n_steps - 1
         starts = list(range(0, max(T - span, 1), args.stride))
         print(f"\nepisode {ep}: {T} frames, task={task!r}, {len(starts)} eval points")
 
@@ -210,7 +193,7 @@ def main():
             # policy still predicts the full chunk; keep only the prefix we score.
             a = a.float().cpu().numpy()[0][:n_steps]  # (n_steps, 14)
 
-            gt = resample_chunk(action, s, n_steps, args.slowdown)
+            gt = gt_chunk(action, s, n_steps)
             n = min(len(gt), len(a))
             preds.append(a[:n])
             gts.append(gt[:n])
@@ -244,7 +227,6 @@ def main():
             "eval_points": len(starts),
             "chunk": chunk,
             "n_action_steps": n_steps,
-            "slowdown_k": args.slowdown,
             "per_dim_mae": dict(zip(DIM_NAMES, per_dim_mae.round(4).tolist())),
             "per_dim_rmse": dict(zip(DIM_NAMES, per_dim_rmse.round(4).tolist())),
             "per_dim_bias": dict(zip(DIM_NAMES, per_dim_bias.round(4).tolist())),
@@ -267,9 +249,8 @@ def main():
             ax.plot(action[:, d], "k-", lw=1.5, label="ground truth", zorder=3)
             for j, s in enumerate(starts):
                 seg = preds[j][:, d]
-                # place the chunk on the demo timeline: 1/k speed means step j of
-                # the chunk lands at demo frame s + j/k.
-                xs = s + np.arange(len(seg)) / args.slowdown
+                # place the chunk on the demo timeline: step j lands at frame s + j.
+                xs = s + np.arange(len(seg))
                 ax.plot(xs, seg, "-", lw=0.8, alpha=0.6,
                         color="tab:red", label="predicted chunk" if j == 0 else None)
             ax.set_title(f"{DIM_NAMES[d]}  (MAE {per_dim_mae[d]:.4f})", fontsize=9)
@@ -278,7 +259,7 @@ def main():
                 ax.legend(fontsize=8)
         fig.suptitle(
             f"Open-loop action prediction — episode {ep} (raw episode_{ep+1:04d})\n"
-            f"{Path(args.checkpoint).parts[-4]} | task={task!r} | slowdown k={args.slowdown:g} "
+            f"{Path(args.checkpoint).parts[-4]} | task={task!r} "
             f"| first {n_steps}/{chunk} steps",
             fontsize=12,
         )

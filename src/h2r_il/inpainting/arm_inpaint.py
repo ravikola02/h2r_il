@@ -25,11 +25,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from .base import VisualMethod, register_visual_method
+from .base import InpaintingMethod, register_inpainting_method
 
 
-@register_visual_method("arm_inpaint")
-class ArmInpaintMethod(VisualMethod):
+@register_inpainting_method("arm_inpaint")
+class ArmInpaintMethod(InpaintingMethod):
     """Detect + segment + inpaint the human arm/hand out of a frame.
 
     Args:

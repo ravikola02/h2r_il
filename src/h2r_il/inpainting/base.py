@@ -1,6 +1,6 @@
-"""VisualMethod: pluggable, cache-backed per-frame image manipulations.
+"""InpaintingMethod: pluggable, cache-backed per-frame image manipulations.
 
-A :class:`VisualMethod` is a callable that LeRobot installs on a dataset via
+A :class:`InpaintingMethod` is a callable that LeRobot installs on a dataset via
 ``dataset.set_image_transforms(...)``. LeRobot hands the callable **one camera
 frame at a time** as a CHW tensor (uint8 or float in [0, 1], RGB) — see
 ``lerobot.datasets.dataset_reader`` (``item[cam] = self._image_transforms(item[cam])``).
@@ -15,8 +15,8 @@ return the same. The base class handles:
   **once per unique frame** — the first pass populates the cache, training then
   just reads it. The cache lives outside the dataset, so datasets stay read-only.
 
-Nothing here is specific to arm inpainting; new visual methods (masking, virtual
-gripper rendering, ...) subclass :class:`VisualMethod` and register themselves.
+Nothing here is specific to arm inpainting; new inpainting methods (masking, virtual
+gripper rendering, ...) subclass :class:`InpaintingMethod` and register themselves.
 """
 
 from __future__ import annotations
@@ -36,15 +36,15 @@ from PIL import Image
 # Registry
 # ---------------------------------------------------------------------------
 
-_REGISTRY: dict[str, type["VisualMethod"]] = {}
+_REGISTRY: dict[str, type["InpaintingMethod"]] = {}
 
 
-def register_visual_method(name: str) -> Callable[[type["VisualMethod"]], type["VisualMethod"]]:
-    """Class decorator: register a :class:`VisualMethod` under ``name``."""
+def register_inpainting_method(name: str) -> Callable[[type["InpaintingMethod"]], type["InpaintingMethod"]]:
+    """Class decorator: register a :class:`InpaintingMethod` under ``name``."""
 
-    def _decorator(cls: type["VisualMethod"]) -> type["VisualMethod"]:
+    def _decorator(cls: type["InpaintingMethod"]) -> type["InpaintingMethod"]:
         if name in _REGISTRY and _REGISTRY[name] is not cls:
-            raise ValueError(f"Visual method {name!r} already registered to {_REGISTRY[name]}")
+            raise ValueError(f"Inpainting method {name!r} already registered to {_REGISTRY[name]}")
         cls.method_name = name
         _REGISTRY[name] = cls
         return cls
@@ -53,35 +53,35 @@ def register_visual_method(name: str) -> Callable[[type["VisualMethod"]], type["
 
 
 def available_methods() -> list[str]:
-    """Names of all registered visual methods."""
+    """Names of all registered inpainting methods."""
     return sorted(_REGISTRY)
 
 
-def build_visual_method(name: str, **kwargs: Any) -> "VisualMethod":
-    """Instantiate a registered visual method by name."""
+def build_inpainting_method(name: str, **kwargs: Any) -> "InpaintingMethod":
+    """Instantiate a registered inpainting method by name."""
     if name not in _REGISTRY:
-        raise KeyError(f"Unknown visual method {name!r}. Available: {available_methods()}")
+        raise KeyError(f"Unknown inpainting method {name!r}. Available: {available_methods()}")
     return _REGISTRY[name](**kwargs)
 
 
-def visual_method_class(name: str) -> type["VisualMethod"]:
+def inpainting_method_class(name: str) -> type["InpaintingMethod"]:
     """The registered class for ``name`` (e.g. to inspect its constructor)."""
     if name not in _REGISTRY:
-        raise KeyError(f"Unknown visual method {name!r}. Available: {available_methods()}")
+        raise KeyError(f"Unknown inpainting method {name!r}. Available: {available_methods()}")
     return _REGISTRY[name]
 
 
 def default_cache_dir() -> Path:
     """Where computed frames are cached (outside any dataset).
 
-    Overridable with ``H2R_VISUAL_CACHE``. Defaults to ``outputs/visual_cache``
+    Overridable with ``H2R_INPAINTING_CACHE``. Defaults to ``outputs/inpaint_cache``
     (``outputs/`` is a symlink to shared storage in this repo).
     """
-    env = os.environ.get("H2R_VISUAL_CACHE")
+    env = os.environ.get("H2R_INPAINTING_CACHE")
     if env:
         return Path(env)
     repo_root = Path(__file__).resolve().parents[3]
-    return repo_root / "outputs" / "visual_cache"
+    return repo_root / "outputs" / "inpaint_cache"
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +89,7 @@ def default_cache_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
-class VisualMethod(ABC):
+class InpaintingMethod(ABC):
     """A cache-backed, per-frame image manipulation.
 
     Args:
@@ -97,8 +97,8 @@ class VisualMethod(ABC):
         cache_dir: override the cache root (default :func:`default_cache_dir`).
     """
 
-    #: set by :func:`register_visual_method`
-    method_name: str = "visual_method"
+    #: set by :func:`register_inpainting_method`
+    method_name: str = "inpainting_method"
 
     def __init__(self, *, cache: bool = True, cache_dir: str | os.PathLike | None = None) -> None:
         self.cache = cache
@@ -172,16 +172,16 @@ class VisualMethod(ABC):
 # ---------------------------------------------------------------------------
 
 
-class VisualMethodPipeline:
-    """Apply a list of :class:`VisualMethod` in order, then an optional ``tail``.
+class InpaintingPipeline:
+    """Apply a list of :class:`InpaintingMethod` in order, then an optional ``tail``.
 
     ``tail`` is any existing transform (e.g. LeRobot's photometric
-    ``ImageTransforms``); it runs *after* the visual methods so the deterministic,
+    ``ImageTransforms``); it runs *after* the inpainting methods so the deterministic,
     cacheable manipulations see the raw frame and random augmentation is layered
     on top.
     """
 
-    def __init__(self, methods: list[VisualMethod], tail: Callable | None = None) -> None:
+    def __init__(self, methods: list[InpaintingMethod], tail: Callable | None = None) -> None:
         self.methods = methods
         self.tail = tail
 
@@ -196,11 +196,11 @@ class VisualMethodPipeline:
         parts = [m.identity() for m in self.methods]
         if self.tail is not None:
             parts.append(f"tail={self.tail!r}")
-        return "VisualMethodPipeline([" + ", ".join(parts) + "])"
+        return "InpaintingPipeline([" + ", ".join(parts) + "])"
 
 
 def build_pipeline(spec: str | list[dict[str, Any]], *, tail: Callable | None = None,
-                   cache_dir: str | os.PathLike | None = None) -> VisualMethodPipeline:
+                   cache_dir: str | os.PathLike | None = None) -> InpaintingPipeline:
     """Build a pipeline from a spec.
 
     ``spec`` is either a JSON string or a list of dicts. Each entry is either a
@@ -218,7 +218,7 @@ def build_pipeline(spec: str | list[dict[str, Any]], *, tail: Callable | None = 
     if isinstance(parsed, (str, dict)):
         parsed = [parsed]
 
-    methods: list[VisualMethod] = []
+    methods: list[InpaintingMethod] = []
     for entry in parsed:
         if isinstance(entry, str):
             name, kwargs = entry, {}
@@ -228,8 +228,8 @@ def build_pipeline(spec: str | list[dict[str, Any]], *, tail: Callable | None = 
             kwargs = entry
         if cache_dir is not None:
             kwargs.setdefault("cache_dir", cache_dir)
-        methods.append(build_visual_method(name, **kwargs))
-    return VisualMethodPipeline(methods, tail=tail)
+        methods.append(build_inpainting_method(name, **kwargs))
+    return InpaintingPipeline(methods, tail=tail)
 
 
 # ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ def _to_uint8_rgb_frames(x: Any) -> tuple[list[np.ndarray], Callable[[list[np.nd
     if isinstance(x, torch.Tensor):
         return _tensor_to_frames(x)
 
-    raise TypeError(f"VisualMethod received unsupported frame type: {type(x)}")
+    raise TypeError(f"InpaintingMethod received unsupported frame type: {type(x)}")
 
 
 def _tensor_to_frames(t: torch.Tensor) -> tuple[list[np.ndarray], Callable[[list[np.ndarray]], torch.Tensor]]:

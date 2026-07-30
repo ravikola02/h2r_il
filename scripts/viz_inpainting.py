@@ -1,33 +1,32 @@
 #!/usr/bin/env python
-"""Test / visualize h2r_il visual methods (arm inpainting, ...).
+"""Test / visualize h2r_il inpainting methods (arm inpainting, ...).
 
 For each requested method and a handful of sampled frames, dumps a labeled panel
 — original next to the method's intermediates and final result (e.g. detected
 boxes | mask overlay | inpainted) — plus a combined contact sheet, to ``--out``.
 Nothing is ever written back into the dataset.
 
-Because every :class:`~h2r_il.transforms.VisualMethod` exposes ``visualize()``,
+Because every :class:`~h2r_il.inpainting.InpaintingMethod` exposes ``visualize()``,
 this tool works for any method you add later: register it, then
 
-    uv run python scripts/viz_visual_methods.py --methods all ...
+    uv run python scripts/viz_inpainting.py --methods all ...
 
 Frames come from a LeRobot dataset (default) or from ``--images`` files.
 
 Examples
 --------
-    # arm inpainting on 6 frames of gear_left (all cameras)
-    uv run python scripts/viz_visual_methods.py \\
-        --dataset ravioli02/gear_left \\
-        --dataset-root /mnt/shared_data/h2r_il/datasets/gear_left \\
+    # arm inpainting on 6 frames of a dataset (all cameras)
+    uv run python scripts/viz_inpainting.py \\
+        --dataset <hf-repo-id> --dataset-root <local dataset dir> \\
         --methods arm_inpaint --num-frames 6
 
     # every registered method, on explicit image files
-    uv run python scripts/viz_visual_methods.py --images a.png b.png --methods all
+    uv run python scripts/viz_inpainting.py --images a.png b.png --methods all
 
     # warm the on-disk cache for a whole dataset so training reads it (no models
-    # loaded at train time). Uses H2R_VISUAL_CACHE if set.
-    uv run python scripts/viz_visual_methods.py \\
-        --dataset ravioli02/gear_left --dataset-root ... \\
+    # loaded at train time). Uses H2R_INPAINTING_CACHE if set.
+    uv run python scripts/viz_inpainting.py \\
+        --dataset <hf-repo-id> --dataset-root ... \\
         --methods arm_inpaint --num-frames -1 --fill-cache --no-panels
 """
 
@@ -45,7 +44,7 @@ from PIL import Image, ImageDraw
 
 import inspect
 
-from h2r_il.transforms import available_methods, build_visual_method, visual_method_class
+from h2r_il.inpainting import available_methods, build_inpainting_method, inpainting_method_class
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -206,7 +205,7 @@ def main() -> int:
     ap.add_argument("--fps", type=float, default=10.0, help="frames/sec for --video")
     ap.add_argument("--start-index", type=int, default=0, help="first dataset index for --video clip")
     ap.add_argument("--tile-width", type=int, default=560)
-    ap.add_argument("--out", default=str(REPO_ROOT / "outputs" / "visual_methods"))
+    ap.add_argument("--out", default=str(REPO_ROOT / "outputs" / "inpainting"))
     ap.add_argument("--num-shards", type=int, default=1,
                     help="split frames across N parallel processes (e.g. one per GPU)")
     ap.add_argument("--shard", type=int, default=0, help="this process's shard index [0, num-shards)")
@@ -232,9 +231,9 @@ def main() -> int:
         name = s.pop("name")
         # forward each override only to methods whose constructor accepts it;
         # CLI overrides win over --spec values.
-        accepted = inspect.signature(visual_method_class(name).__init__).parameters
+        accepted = inspect.signature(inpainting_method_class(name).__init__).parameters
         s.update({k: v for k, v in overrides.items() if k in accepted})
-        methods.append(build_visual_method(name, cache=use_cache, **s))
+        methods.append(build_inpainting_method(name, cache=use_cache, **s))
 
     # resolve frames (lazy: streamed one at a time, never all held in RAM).
     # --video wants a real temporal clip, so sample consecutive frames.

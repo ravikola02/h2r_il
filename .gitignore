@@ -8,3 +8,11 @@ logs/
 .env
 .claude/
 *.code-workspace
+
+# Machine-specific: paths, disks, envs, accounts. Never commit these.
+LOCAL_SETUP.md
+configs/local.env
+
+# One-off dated chains (scripts/chain_YYYYMMDD.sh) — records of individual runs,
+# with machine paths baked in. scripts/chain.sh is the maintained one.
+scripts/chain_*.sh
