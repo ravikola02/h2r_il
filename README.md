@@ -48,6 +48,17 @@ Notes from the smoke runs:
 
 ### Phase 1 — annotation-driven frame manipulation (current)
 
+**Training modes so far — two.** Both are trained and validated by `scripts/chain.sh` on
+the same dataset with identical hyperparameters, so the pair isolates the manipulation:
+
+| mode | frames the policy sees |
+|---|---|
+| `raw` | the recorded frames, untouched — the baseline |
+| `inpaint` | the demonstrator's arm/hand inpainted out of every frame (`arm_inpaint`) |
+
+A third signal, **object grounding**, is still being explored and is not part of the
+training pipeline yet — see below.
+
 **Inpainting framework** (`src/h2r_il/inpainting/`). An *inpainting method* is a cache-backed, per-frame image manipulation. `InpaintingMethod` (base) handles tensor⇄numpy conversion (uint8/float, CHW/`(T,C,H,W)`, RGB), a content-addressed disk cache, and a registry; subclasses implement `apply(rgb_uint8) -> rgb_uint8`. New methods self-register with `@register_inpainting_method("name")` and are immediately usable everywhere.
 
 **Injection into training.** LeRobot's `--dataset.image_transforms` config only accepts torchvision-v2 augmentations, so a custom class can't be named there. Instead we use LeRobot's own extension point — `LeRobotDataset.set_image_transforms` — from a thin wrapper (`h2r_il.train`) that never forks LeRobot: the raw frame flows through our methods first (deterministic, cached), then any photometric augmentation. The dataset on disk is never touched.
@@ -132,6 +143,14 @@ observations always come from the recording, so errors do not compound the way a
 would. Reports per-dim MAE/RMSE/bias, a debiased MAE (is it just a frame shift?), a
 frozen-state baseline any useful policy must beat, and per-episode trajectory plots.
 
+**Object grounding (exploratory, not wired into training).** The third candidate signal is
+where the manipulated object is, per frame: open-vocabulary detection and segmentation
+(Grounding DINO → SAM2) give a 2D track, and a monocular depth + mesh + pose-tracking chain
+lifts it to 6-DoF object pose. Detection and segmentation track a clip reliably; the 6-DoF
+stage is the open part, since depth, mesh and metric scale are all estimated from a single
+view. If it lands, it feeds Phase 2 as an object-motion auxiliary loss rather than as
+another frame manipulation. Nothing here is on the training path today.
+
 ### Phase 2 — auxiliary losses (next)
 
 - Policy subclasses registered as custom policy types (e.g. `pi0_h2r`, `groot_h2r`) that add aux loss terms to the training objective
@@ -140,12 +159,13 @@ frozen-state baseline any useful policy must beat, and per-episode trajectory pl
 ### Phase 3 — experiments
 
 - Real fine-tuning runs on the annotated human-demo dataset
-- Ablations: masking on/off, aux losses on/off, per-model (pi0 vs GR00T N1.7)
+- Ablations: raw vs inpainted frames, aux losses on/off, per-model (pi0 vs GR00T N1.7)
 - Evaluation on the target benchmark/robot
 
 ## Open questions
 
-- Exact masking spec: what gets masked (hand/arm? background?), mask source, per-camera behavior
+- Inpainting spec: how much to remove (hand/arm? forearm? shadows?) and per-camera behaviour
+- Object grounding: whether monocular 6-DoF object pose is accurate enough to train on
 - Annotation format and how annotations are stored/loaded alongside the LeRobot dataset
 - Aux loss definitions and where they attach in each model
 - Evaluation benchmark / robot setup
