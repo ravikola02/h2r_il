@@ -40,6 +40,8 @@ Usage:
 
 import argparse
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -224,19 +226,34 @@ def tagging_guide(episodes: pd.DataFrame, camera: str) -> dict:
 # --------------------------------------------------------------------------------
 
 def stage_video(video: Path, work_dir: Path, stem: str) -> Path:
-    """Symlink the dataset video into the work dir under a readable name.
+    """Hard-link the dataset video into the work dir under a readable name.
 
     :mod:`h2r_il.object_pose` writes ``<stem>_crop.mp4`` and the prompts JSON
-    *next to the video it is given*. Handing it the path inside the dataset would
-    write into a tree this project treats as read-only, so it gets a symlink in
-    our own directory instead. A symlink, not a copy: the source is 143 MB and
-    ffmpeg follows it happily.
+    *next to the video it is given*, so it must be given a path in our own
+    directory rather than one inside the dataset.
+
+    A hard link, specifically, and this is the whole point: object_pose resolves
+    ``--video`` with ``Path.resolve()``, which follows a **symlink** back to the
+    dataset and writes there anyway -- silently defeating the staging. This is not
+    hypothetical; a 152 MB crop and the prompts JSON landed in the dataset's video
+    directory that way. ``resolve()`` has nothing to follow on a hard link: the
+    path stays in the work dir while the bytes stay shared, so staging costs no
+    disk and the dataset stays untouched.
+
+    Hard links cannot cross filesystems. Outputs and datasets share one mount
+    here, so the fallback should not trigger, but a copy is better than quietly
+    writing into the dataset again.
     """
     work_dir.mkdir(parents=True, exist_ok=True)
     staged = work_dir / f"{stem}.mp4"
     if staged.is_symlink() or staged.exists():
         staged.unlink()
-    staged.symlink_to(video)
+    try:
+        os.link(video, staged)
+    except OSError:
+        print(f"[warn] cannot hard-link across filesystems; copying "
+              f"{video.stat().st_size / 1e6:.0f} MB instead.")
+        shutil.copy2(video, staged)
     return staged
 
 
