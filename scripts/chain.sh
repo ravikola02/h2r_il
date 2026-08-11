@@ -8,6 +8,11 @@
 #   ./scripts/chain.sh pause     stop training and FREE THE GPUS; fully resumable
 #   ./scripts/chain.sh stop      abandon the chain (no resume)
 #
+# --no-gpu-wait (alias --skip-gpu-check) works with any command: launch the GPU
+# stages immediately instead of waiting for the GPUs to be mostly free. Use it
+# when you know the memory in use is yours, or when you accept sharing a card.
+# Same effect as GPU_FREE_PCT=0, and it carries into the detached supervisor.
+#
 # Five stages: train raw -> validate -> warm inpaint cache -> train inpaint ->
 # validate. Both trainings are GR00T on the same dataset with the same steps and
 # batch size; the only difference is that the second sees arm-inpainted frames
@@ -46,14 +51,37 @@ NUM_GPUS=${NUM_GPUS:-2}
 # "Killed" (host OOM, not CUDA OOM), this is the first knob to lower: prefetched
 # batches are ~BATCH_SIZE x 3 cameras of full-res frames per worker.
 NUM_WORKERS=${NUM_WORKERS:-8}
+# Batches each worker keeps queued. LeRobot's default is 4 (configs/train.py),
+# which on kitting parked ~43 GB of decoded video in shared memory and left the
+# host with ~4 GB free. Training itself survives that, but the first checkpoint
+# save does not: rank 0 has to serialize ~12.5 GB of model under that memory
+# pressure, the save crawls past rank 1's NCCL collective timeout, and the whole
+# job aborts at step 1000 with a ChildFailedError (seen 2026-08-05 11:56). 2
+# halves the shm footprint and keeps step time -- lowering NUM_WORKERS does not
+# fix it, this is the knob that does.
+PREFETCH_FACTOR=${PREFETCH_FACTOR:-2}
 STEPS=${STEPS:-20000}
-# Checkpoint cadence, and therefore how much a pause can cost: at ~6 s/step,
-# 250 steps is ~25 min of work at risk. Lower = cheaper pause, more 24 GB writes.
-SAVE_FREQ=${SAVE_FREQ:-250}
+# Checkpoint cadence, and therefore how much a pause (or an OOM kill) can cost:
+# at ~5 s/step, 1000 steps is ~85 min of work at risk. Lower = cheaper pause,
+# more 25 GB writes.
+SAVE_FREQ=${SAVE_FREQ:-1000}
+# How many checkpoints to keep alive. 2 means the previous one survives the next
+# save, so a checkpoint corrupted mid-write still leaves a resumable predecessor.
+# Each is ~25 GB and a save briefly holds one more, so budget
+# CKPT_GB x (KEEP_CKPTS + 1) of disk (see check_disk).
+KEEP_CKPTS=${KEEP_CKPTS:-2}
 EPISODES=${EPISODES:-"14 15 19"}
+# Stop the chain cleanly after a named stage instead of running all five, e.g.
+# STOP_AFTER=val_raw trains and validates the raw arm and stops there. Use it
+# when the later stages are not wanted -- notably when the inpaint cache has been
+# cleared, since the `warm` stage would otherwise silently spend hours rebuilding
+# it. The state file is saved first, so a later `resume` picks up where it left
+# off. Empty (the default) runs the whole chain.
+STOP_AFTER=${STOP_AFTER:-}
 # GPU work waits until every GPU it will use is at least this % free (memory).
-# Lets you queue the chain behind someone else's job. 0 disables the wait;
-# GPU_WAIT_TIMEOUT=0 waits forever, otherwise give up (and fail) after N seconds.
+# Lets you queue the chain behind someone else's job. 0 disables the wait (what
+# --no-gpu-wait sets); GPU_WAIT_TIMEOUT=0 waits forever, otherwise give up (and
+# fail) after N seconds.
 GPU_FREE_PCT=${GPU_FREE_PCT:-80}
 GPU_WAIT_TIMEOUT=${GPU_WAIT_TIMEOUT:-0}
 GPU_POLL=${GPU_POLL:-30}
@@ -129,20 +157,20 @@ latest_ckpt() {  # latest_ckpt <job> -> newest complete checkpoint dir, or empty
     done < <(ls -1d "outputs/$1/checkpoints"/[0-9]* 2>/dev/null | sort -r)
 }
 
-# Space needed before a training stage: two checkpoints (the pruner briefly
-# holds the new one alongside the old) plus headroom. A full disk used to
-# surface as a crash an hour in, mid-checkpoint-write; this fails at step 0.
+# Space needed before a training stage: the KEEP_CKPTS we hold plus the one
+# being written before the pruner catches up. A full disk used to surface as a
+# crash an hour in, mid-checkpoint-write; this fails at step 0.
 CKPT_GB=${CKPT_GB:-25}
 check_disk() {
-    local need=$((CKPT_GB * 2)) free
+    local need=$((CKPT_GB * (KEEP_CKPTS + 1))) free
     free=$(df -BG --output=avail "$(readlink -f outputs)" 2>/dev/null | tail -1 | tr -dc '0-9')
     [[ -z $free ]] && { say "warning: could not read free space; continuing"; return 0; }
     if (( free < need )); then
-        say "only ${free}G free where checkpoints land; need ~${need}G (2 x ${CKPT_GB}G)"
+        say "only ${free}G free where checkpoints land; need ~${need}G ($((KEEP_CKPTS + 1)) x ${CKPT_GB}G)"
         say "free space or lower CKPT_GB, then resume"
         return 1
     fi
-    say "disk ok: ${free}G free (need ~${need}G)"
+    say "disk ok: ${free}G free (need ~${need}G for $KEEP_CKPTS kept + 1 in flight)"
 }
 
 # The H2R_* hooks live in env vars, not in train_config.json, so they must be
@@ -159,15 +187,15 @@ export_hooks() {  # export_hooks [with_inpainting]
     fi
 }
 
-# Checkpoints are ~24 GB and LeRobot never prunes them. At SAVE_FREQ=250 a run
-# would write 80 of them; this keeps only the newest (plus the final) so a run
-# costs ~24-48 GB instead of filling the disk.
+# Checkpoints are ~25 GB and LeRobot never prunes them. At SAVE_FREQ=1000 a run
+# would write 20 of them; this keeps the newest KEEP_CKPTS (plus the final one)
+# so a run costs ~50-75 GB instead of filling the disk.
 start_pruner() {
     ( while true; do
         sleep 120
         local d="outputs/$1/checkpoints"
         [[ -d $d ]] || continue
-        ls -1dt "$d"/[0-9]* 2>/dev/null | grep -v "/$CKPT_DIR\$" | tail -n +2 \
+        ls -1dt "$d"/[0-9]* 2>/dev/null | grep -v "/$CKPT_DIR\$" | tail -n +$((KEEP_CKPTS + 1)) \
             | while read -r old; do rm -rf "$old"; done
       done ) &
     PRUNER=$!
@@ -177,7 +205,10 @@ stop_pruner() { [[ -n "${PRUNER:-}" ]] && kill "$PRUNER" 2>/dev/null; PRUNER="";
 # Block until GPUs 0..NUM_GPUS-1 are each >= GPU_FREE_PCT% free memory, so the
 # chain can be queued behind another job instead of OOM-ing next to it.
 wait_for_gpus() {
-    (( GPU_FREE_PCT <= 0 )) && return 0
+    if (( GPU_FREE_PCT <= 0 )); then
+        say "GPU availability check skipped (GPU_FREE_PCT=0)"
+        return 0
+    fi
     local waited=0 busy
     while :; do
         busy=$(nvidia-smi --query-gpu=index,memory.free,memory.total \
@@ -222,21 +253,23 @@ run_train() {  # run_train <job> [with_inpainting]
     if [[ -n $ckpt && -f $ckpt/pretrained_model/train_config.json ]]; then
         # Resume: the checkpoint's own config carries batch size, steps, relative
         # actions, etc. Passing them again risks contradicting it, so we don't.
-        # num_workers is the one exception: it is a throughput knob, not part of
-        # the training semantics (the sampler order is seeded independently of it),
-        # so it is safe to override and must be, or a resume would restore
-        # whatever worker count the checkpoint was written with.
-        say "resuming $job from $(basename "$ckpt") (sample-exact, workers=$NUM_WORKERS)"
+        # num_workers and save_freq are the exceptions: neither changes what the
+        # policy learns (the sampler order is seeded independently of the worker
+        # count, and the save cadence is bookkeeping), and both must be re-passed
+        # or a resume would silently restore whatever the checkpoint was written
+        # with -- e.g. keep saving every 250 steps after you moved to 1000.
+        say "resuming $job from $(basename "$ckpt") (sample-exact, workers=$NUM_WORKERS, prefetch=$PREFETCH_FACTOR, save_freq=$SAVE_FREQ)"
         "${UV[@]}" accelerate launch --multi_gpu --num_processes="$NUM_GPUS" -m h2r_il.train \
             --config_path="$ckpt/pretrained_model/train_config.json" --resume=true \
-            --num_workers="$NUM_WORKERS"
+            --num_workers="$NUM_WORKERS" --prefetch_factor="$PREFETCH_FACTOR" --save_freq="$SAVE_FREQ"
     else
         say "starting $job from scratch"
         CONFIG=$CONFIG DATASET=$DATASET DATASET_ROOT=${DATASET_ROOT:-} \
         NUM_GPUS=$NUM_GPUS BATCH_SIZE=$BATCH_SIZE \
         NUM_WORKERS=$NUM_WORKERS WANDB=$WANDB JOB_NAME="$job" \
         INPAINTING=${H2R_INPAINTING:-} INPAINTING_CACHE=${H2R_INPAINTING_CACHE:-} \
-            ./scripts/ft_groot.sh --steps="$STEPS" --save_freq="$SAVE_FREQ"
+            ./scripts/ft_groot.sh --steps="$STEPS" --save_freq="$SAVE_FREQ" \
+                                  --prefetch_factor="$PREFETCH_FACTOR"
     fi
     local rc=$?
     stop_pruner
@@ -288,7 +321,9 @@ print(d.get("total_frames", 0) * len(cams))' "$info" 2>/dev/null || echo "?"
 __run() {
     load
     trap 'stop_pruner' EXIT
+    local finished
     while :; do
+        finished=$STAGE
         case $STAGE in
             train_raw)     say "[1/5] train $JOB_RAW (raw frames)"
                            run_train "$JOB_RAW"     || die "training $JOB_RAW failed"; STAGE=val_raw ;;
@@ -308,6 +343,11 @@ __run() {
             *)             die "unknown stage '$STAGE'" ;;
         esac
         save
+        if [[ -n $STOP_AFTER && $finished == "$STOP_AFTER" ]]; then
+            say "stopping after '$finished' as requested (STOP_AFTER); next stage would be '$STAGE'"
+            say "run './scripts/chain.sh resume' to continue from there"
+            exit 0
+        fi
     done
 }
 
@@ -333,7 +373,9 @@ cmd_start() {  # cmd_start [dataset] [run-name] [dataset-root]
         [[ -n ${1:-} ]] && die "a chain on $DATASET is already staged at '$STAGE'; run '$0 stop' first to switch dataset"
         say "continuing $DATASET from stage '$STAGE'"
     fi
-    say "batch=$BATCH_SIZE x $NUM_GPUS (effective $((BATCH_SIZE*NUM_GPUS))), workers=$NUM_WORKERS/gpu, steps=$STEPS, save_freq=$SAVE_FREQ, wandb=$WANDB"
+    say "batch=$BATCH_SIZE x $NUM_GPUS (effective $((BATCH_SIZE*NUM_GPUS))), workers=$NUM_WORKERS/gpu, prefetch=$PREFETCH_FACTOR, steps=$STEPS, save_freq=$SAVE_FREQ, keep=$KEEP_CKPTS, wandb=$WANDB"
+    [[ -n $STOP_AFTER ]] && say "will stop after stage '$STOP_AFTER'"
+    if (( GPU_FREE_PCT <= 0 )); then say "GPU wait DISABLED -- stages start immediately"; fi
     nohup setsid "$0" __run >> "$LOG" 2>&1 &
     sleep 2
     say "started. following $LOG -- Ctrl-C detaches, training keeps going."
@@ -387,6 +429,19 @@ cmd_stop() {
     say "stopped. checkpoints kept; state moved to $STATE.abandoned"
 }
 
+# --no-gpu-wait may appear anywhere in the argument list; strip it before the
+# positional arguments are read. GPU_FREE_PCT is exported either way, so the
+# detached supervisor (and every stage it runs) sees the same policy.
+ARGS=()
+for arg in "$@"; do
+    case $arg in
+        --no-gpu-wait|--skip-gpu-check) GPU_FREE_PCT=0 ;;
+        *) ARGS+=("$arg") ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+export GPU_FREE_PCT STOP_AFTER
+
 case "${1:-}" in
     start)  shift; cmd_start "$@" ;;
     resume) cmd_start ;;                       # same path: continue from saved stage
@@ -395,5 +450,5 @@ case "${1:-}" in
     stop)   cmd_stop ;;
     logs)   tail -f "$LOG" ;;
     __run)  __run ;;
-    *) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+    *) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac

@@ -61,9 +61,19 @@ def frames_from_images(paths: list[str]) -> tuple[Iterator[tuple[str, np.ndarray
     return _gen(), len(paths)
 
 
+def _episode_range(ds, episode: int) -> tuple[int, int]:
+    """``[from, to)`` global frame indices of ``episode`` (LeRobot v3 metadata)."""
+    eps = ds.meta.episodes
+    n_eps = len(eps["dataset_from_index"])
+    if not 0 <= episode < n_eps:
+        raise SystemExit(f"--episode {episode} out of range: dataset has {n_eps} episode(s)")
+    return int(eps["dataset_from_index"][episode]), int(eps["dataset_to_index"][episode])
+
+
 def frames_from_dataset(
     repo_id: str, root: str | None, cameras: list[str] | None, num_frames: int,
     shard: int = 0, num_shards: int = 1, consecutive: bool = False, start: int = 0,
+    episode: int | None = None,
 ) -> tuple[Iterator[tuple[str, np.ndarray, str]], int]:
     """Stream ``(name, HxWx3 uint8, camera)`` frames from a LeRobot dataset.
 
@@ -73,6 +83,9 @@ def frames_from_dataset(
 
     ``consecutive`` samples a contiguous run from ``start`` (a real temporal clip,
     for video) instead of frames spread evenly across the dataset.
+    ``episode`` restricts the run to a single episode, resolving its global frame
+    range from the dataset metadata; ``num_frames`` then truncates that episode
+    (-1 / unset takes the whole thing) and ``start`` is an offset *within* it.
     ``shard``/``num_shards`` slice the frame indices so N processes (e.g. one per
     GPU, each with its own CUDA_VISIBLE_DEVICES) can warm the shared cache in
     parallel.
@@ -82,7 +95,13 @@ def frames_from_dataset(
     ds = LeRobotDataset(repo_id, root=root, return_uint8=True)
     cam_keys = cameras or list(ds.meta.camera_keys)
     n = len(ds)
-    if num_frames is None or num_frames < 0 or num_frames >= n:
+    if episode is not None:
+        ep0, ep1 = _episode_range(ds, episode)
+        lo = ep0 + max(0, start)
+        idxs = list(range(min(lo, ep1), ep1))
+        if num_frames is not None and 0 <= num_frames < len(idxs):
+            idxs = idxs[:num_frames]
+    elif num_frames is None or num_frames < 0 or num_frames >= n:
         idxs = list(range(n))
     elif consecutive:
         idxs = list(range(start, min(start + num_frames, n)))
@@ -204,6 +223,9 @@ def main() -> int:
                     help="write an mp4 (original|result over consecutive frames) per method+camera")
     ap.add_argument("--fps", type=float, default=10.0, help="frames/sec for --video")
     ap.add_argument("--start-index", type=int, default=0, help="first dataset index for --video clip")
+    ap.add_argument("--episode", type=int,
+                    help="restrict to one episode (its frame range is looked up in the "
+                         "dataset metadata); --start-index is then an offset within it")
     ap.add_argument("--tile-width", type=int, default=560)
     ap.add_argument("--out", default=str(REPO_ROOT / "outputs" / "inpainting"))
     ap.add_argument("--num-shards", type=int, default=1,
@@ -243,7 +265,7 @@ def main() -> int:
         frame_iter, total = frames_from_dataset(
             args.dataset, args.dataset_root, args.cameras, args.num_frames,
             shard=args.shard, num_shards=args.num_shards,
-            consecutive=args.video, start=args.start_index,
+            consecutive=args.video, start=args.start_index, episode=args.episode,
         )
     else:
         ap.error("provide --images or --dataset")
@@ -271,16 +293,20 @@ def main() -> int:
             t0 = time.time()
             if not need_result:
                 m(img[None].transpose(0, 3, 1, 2))  # exercise __call__/cache, discard
+            elif args.video:
+                # A video shows only original|result, so go through the cached
+                # __call__ rather than visualize(): the latter recomputes the
+                # boxes/mask intermediates the video never renders, and skips the
+                # cache entirely (~0.65 s/frame even when the frame is warm).
+                result = m(img)
+                vframe = _hconcat([_tile(img, "original", args.tile_width),
+                                   _tile(result, m.method_name, args.tile_width)])
+                videos.setdefault((m.method_name, group), []).append(vframe)
             else:
                 viz = m.visualize(img)
-                if args.video:
-                    vframe = _hconcat([_tile(img, "original", args.tile_width),
-                                       _tile(viz["result"], m.method_name, args.tile_width)])
-                    videos.setdefault((m.method_name, group), []).append(vframe)
-                if save_panels:
-                    panel = build_panel(img, viz, m.method_name, args.tile_width)
-                    Image.fromarray(panel).save(out_dir / f"{fname}__{m.method_name}.png")
-                    all_rows.append(panel)
+                panel = build_panel(img, viz, m.method_name, args.tile_width)
+                Image.fromarray(panel).save(out_dir / f"{fname}__{m.method_name}.png")
+                all_rows.append(panel)
             done += 1
             # progress with rolling ETA (per-frame when producing output; every 25
             # for a big cache-only warm)
