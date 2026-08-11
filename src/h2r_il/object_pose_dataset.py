@@ -44,6 +44,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from h2r_il.object_pose import (
@@ -239,6 +240,84 @@ def stage_video(video: Path, work_dir: Path, stem: str) -> Path:
     return staged
 
 
+# --------------------------------------------------------------------------------
+# The pose store
+# --------------------------------------------------------------------------------
+
+def build_store(trajectory: Path, info: dict, episodes: pd.DataFrame,
+                offset: int) -> tuple[dict, dict]:
+    """Place a trajectory onto the dataset's global frame axis.
+
+    ``offset`` is the dataset frame the trajectory's frame 0 corresponds to. For a
+    whole-video run that is 0 and the mapping is the identity; for a trajectory
+    tracked from a single episode's clip it is that episode's start frame. Keeping
+    the offset explicit is what lets per-episode runs be stitched into the same
+    store if whole-video tracking turns out not to survive the scene cuts.
+
+    Dense, not sparse. 20613 frames of 4x4 float32 is 1.3 MB -- small enough that
+    the simplest possible layout wins, and a DataLoader gets O(1) lookup by the
+    global index it already has. Frames with no pose stay zero and are marked in
+    ``valid``; that mask has to reach the loss, or uncovered frames would train
+    the model towards a pose of all zeros.
+    """
+    data = np.load(trajectory)
+    total_frames = int(info["total_frames"])
+
+    frames = data["frame_index"].astype(np.int64) + offset
+    if frames.min() < 0 or frames.max() >= total_frames:
+        sys.exit(f"trajectory maps to dataset frames {frames.min()}..{frames.max()}, "
+                 f"outside 0..{total_frames - 1}. Wrong --offset/--episode?")
+
+    valid = np.zeros(total_frames, dtype=bool)
+    valid[frames] = True
+
+    store = {
+        "T_cam_obj": np.zeros((total_frames, 4, 4), dtype=np.float32),
+        "position": np.zeros((total_frames, 3), dtype=np.float32),
+        "quat_xyzw": np.zeros((total_frames, 4), dtype=np.float32),
+        "valid": valid,
+    }
+    store["T_cam_obj"][frames] = data["T_cam_obj"].astype(np.float32)
+    store["position"][frames] = data["position"].astype(np.float32)
+    store["quat_xyzw"][frames] = data["quat_xyzw"].astype(np.float32)
+
+    # Carry the episode axis so a consumer can group, split or report by episode
+    # without re-reading the dataset's own metadata.
+    lengths = episodes["length"].to_numpy()
+    starts = lengths.cumsum() - lengths
+    episode_of = np.repeat(episodes["episode_index"].to_numpy(), lengths)
+    frame_in_episode = np.arange(total_frames) - np.repeat(starts, lengths)
+    store["episode_index"] = episode_of.astype(np.int32)
+    store["frame_in_episode"] = frame_in_episode.astype(np.int32)
+
+    store["intrinsics"] = data["intrinsics"].astype(np.float32)
+    store["image_size"] = data["image_size"].astype(np.int32)
+
+    covered = [int(valid[s:s + n].sum()) for s, n in zip(starts, lengths)]
+    coverage = {
+        "frames_with_pose": int(valid.sum()),
+        "frames_total": total_frames,
+        "episodes_fully_covered": int(sum(c == n for c, n in zip(covered, lengths))),
+        "episodes_partially_covered": int(sum(0 < c < n for c, n in zip(covered, lengths))),
+        "episodes_uncovered": int(sum(c == 0 for c in covered)),
+        "per_episode": [
+            {"episode_index": int(e), "covered": int(c), "length": int(n)}
+            for e, c, n in zip(episodes["episode_index"], covered, lengths)
+        ],
+    }
+    return store, coverage
+
+
+def write_store(store: dict, coverage: dict, out_dir: Path, provenance: dict) -> Path:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npz_path = out_dir / "object_pose.npz"
+    np.savez(npz_path, **store)
+    meta = dict(provenance)
+    meta["coverage"] = coverage
+    (out_dir / "object_pose.json").write_text(json.dumps(meta, indent=2))
+    return npz_path
+
+
 def dataset_name(dataset_root: Path) -> str:
     """A short label for this dataset, used to namespace outputs.
 
@@ -337,6 +416,62 @@ def command_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_store(args: argparse.Namespace) -> int:
+    dataset_root = resolve_dataset_root(args.dataset_root)
+    info = load_info(dataset_root)
+    episodes = load_episodes(dataset_root)
+    work_dir = Path(args.work_dir).expanduser().absolute() if args.work_dir \
+        else default_work_dir(dataset_root, args.camera)
+
+    trajectory = (Path(args.trajectory).expanduser().absolute() if args.trajectory
+                  else work_dir / "run" / "trajectory.npz")
+    if not trajectory.is_file():
+        sys.exit(f"no trajectory at {trajectory}. Track first, or pass --trajectory.")
+
+    # --episode is the ergonomic form of --offset: a trajectory tracked from one
+    # episode's clip starts at that episode's first dataset frame.
+    if args.episode is not None:
+        lengths = episodes["length"].to_numpy()
+        starts = lengths.cumsum() - lengths
+        matches = episodes.index[episodes["episode_index"] == args.episode]
+        if len(matches) == 0:
+            sys.exit(f"no episode {args.episode} in this dataset.")
+        offset = int(starts[matches[0]])
+    else:
+        offset = args.offset
+
+    store, coverage = build_store(trajectory, info, episodes, offset)
+
+    run_manifest = trajectory.parent / "run_manifest.json"
+    provenance = {
+        "dataset": str(dataset_root),
+        "dataset_name": dataset_name(dataset_root),
+        "camera": args.camera,
+        "trajectory": str(trajectory),
+        "frame_offset": offset,
+        "frame_convention": "index into the dataset's global frame axis",
+        "pose_convention": ("object->camera 4x4 in the OpenCV optical frame, as "
+                            "written by h2r_il.object_pose"),
+        "run_manifest": (json.loads(run_manifest.read_text())
+                         if run_manifest.is_file() else None),
+    }
+    out_dir = Path(args.out).expanduser().absolute() if args.out else work_dir / "store"
+    npz_path = write_store(store, coverage, out_dir, provenance)
+
+    print(f"trajectory  {trajectory}")
+    print(f"offset      {offset}  (dataset frame of the trajectory's frame 0)")
+    print(f"store       {npz_path}  ({npz_path.stat().st_size / 1e6:.1f} MB)")
+    print(f"\ncoverage    {coverage['frames_with_pose']}/{coverage['frames_total']} "
+          f"frames ({100 * coverage['frames_with_pose'] / coverage['frames_total']:.1f}%)")
+    print(f"            episodes: {coverage['episodes_fully_covered']} full, "
+          f"{coverage['episodes_partially_covered']} partial, "
+          f"{coverage['episodes_uncovered']} uncovered")
+    if coverage["episodes_uncovered"]:
+        print("\nUncovered episodes carry valid=False for every frame. Whatever "
+              "consumes this store must mask them out of the loss.")
+    return 0
+
+
 def command_status(args: argparse.Namespace) -> int:
     dataset_root = resolve_dataset_root(args.dataset_root)
     work_dir = Path(args.work_dir).expanduser().resolve() if args.work_dir \
@@ -354,9 +489,19 @@ def command_status(args: argparse.Namespace) -> int:
         ("run manifest", work_dir / "run" / "run_manifest.json"),
         ("trajectory  ", work_dir / "run" / "trajectory.npz"),
         ("overlay     ", work_dir / "run" / "overlay.mp4"),
+        ("pose store  ", work_dir / "store" / "object_pose.npz"),
     ):
         mark = "x" if path.exists() else " "
         print(f"  [{mark}] {label}  {path.name}")
+
+    store_meta = work_dir / "store" / "object_pose.json"
+    if store_meta.is_file():
+        coverage = json.loads(store_meta.read_text())["coverage"]
+        print(f"\n  store covers {coverage['frames_with_pose']}/"
+              f"{coverage['frames_total']} frames; episodes "
+              f"{coverage['episodes_fully_covered']} full, "
+              f"{coverage['episodes_partially_covered']} partial, "
+              f"{coverage['episodes_uncovered']} uncovered")
 
     prompts = work_dir / f"{stem}_crop_prompts.json"
     if prompts.is_file():
@@ -378,6 +523,8 @@ def build_parser() -> argparse.ArgumentParser:
     for name, handler, help_text in (
         ("prepare", command_prepare,
          "Verify frame alignment and stage the camera video for tagging."),
+        ("store", command_store,
+         "Place a tracked trajectory onto the dataset's global frame axis."),
         ("status", command_status, "What has been produced so far."),
     ):
         sub = subparsers.add_parser(name, help=help_text, description=help_text)
@@ -387,6 +534,17 @@ def build_parser() -> argparse.ArgumentParser:
                          help=f"Video feature to track. Default: {DEFAULT_CAMERA}")
         sub.add_argument("--work-dir", help="Where to stage. Default: "
                                             "outputs/object_pose/<dataset>/<camera>")
+        if name == "store":
+            sub.add_argument("--trajectory", help="trajectory.npz to place. "
+                                                  "Default: <work-dir>/run/trajectory.npz")
+            placement = sub.add_mutually_exclusive_group()
+            placement.add_argument("--offset", type=int, default=0,
+                                   help="Dataset frame that the trajectory's frame 0 "
+                                        "is. Default 0, i.e. a whole-video run.")
+            placement.add_argument("--episode", type=int,
+                                   help="Trajectory came from this episode's clip; "
+                                        "its start frame becomes the offset.")
+            sub.add_argument("--out", help="Store directory. Default: <work-dir>/store")
         sub.set_defaults(handler=handler)
 
     return parser
