@@ -1,0 +1,158 @@
+#!/usr/bin/env python
+"""Attach precomputed object poses to training samples.
+
+All the perception happens up front (`object_pose_dataset track` / `store`), so
+training only needs a lookup. The store is dense and indexed by the dataset's
+**global frame index**, which every LeRobot sample already carries as
+``item["index"]`` -- so injection is one dict assignment per sample, with no
+decoding, no I/O and no per-worker state.
+
+Why not write the pose into the dataset itself, as a real feature? It would be
+loaded and normalised natively, but it means rewriting the dataset (or copying
+it, on a disk with ~26 GB free), and this project treats the exported dataset as
+read-only. It would also land in the ``observation.`` namespace where a policy
+may try to consume it as an input. Injection keeps the dataset untouched and the
+pose clearly a *target*, and the data is no less precomputed for it.
+
+The whole store is 20613 x (4x4 + flags) float32 -- about 2 MB. It is read once
+into RAM at startup; DataLoader workers inherit it by fork, so there is no
+per-worker cost and no memory-mapping subtlety.
+
+Enable it the same way as inpainting, from the environment::
+
+    H2R_OBJECT_POSE=<store dir or object_pose.npz>
+    H2R_OBJECT_POSE_TARGET=position   # position (default) | pose6d
+
+``position`` emits xyz only. That is the recommended target: rotation comes from
+an arbitrary SAM3D body frame and nothing in this pipeline validates it (MoGe
+gives depth, not orientation). ``pose6d`` emits xyz + wxyz quaternion for when
+that changes.
+
+Every sample gets ``object_pose_valid``. Frames with no pose emit zeros with the
+flag false, and **the loss must mask on it** -- otherwise uncovered frames train
+the model towards a pose of all zeros.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+
+import numpy as np
+import torch
+
+POSE_KEY = "object_pose"
+VALID_KEY = "object_pose_valid"
+
+logger = logging.getLogger(__name__)
+
+
+class PoseStore:
+    """Dense per-frame object poses, looked up by global dataset frame index."""
+
+    def __init__(self, path: str | Path, target: str = "position") -> None:
+        path = Path(path).expanduser()
+        if path.is_dir():
+            path = path / "object_pose.npz"
+        if not path.is_file():
+            raise FileNotFoundError(f"no pose store at {path}")
+        if target not in ("position", "pose6d"):
+            raise ValueError(f"target must be 'position' or 'pose6d', got {target!r}")
+
+        data = np.load(path)
+        self.path = path
+        self.target = target
+        self.valid = torch.from_numpy(data["valid"].astype(np.bool_))
+
+        position = data["position"].astype(np.float32)
+        if target == "position":
+            self.values = torch.from_numpy(position)
+        else:
+            # xyz + wxyz. Stored quaternions are xyzw; reorder rather than make
+            # the consumer guess which convention it received.
+            quat_xyzw = data["quat_xyzw"].astype(np.float32)
+            quat_wxyz = quat_xyzw[:, [3, 0, 1, 2]]
+            self.values = torch.from_numpy(np.concatenate([position, quat_wxyz], axis=1))
+
+        self.dim = self.values.shape[1]
+        covered = int(self.valid.sum())
+        logger.info(
+            "object pose store %s: %d/%d frames covered (%.1f%%), target=%s, dim=%d",
+            path, covered, len(self.valid), 100 * covered / len(self.valid), target, self.dim
+        )
+
+    def __len__(self) -> int:
+        return len(self.valid)
+
+    def attach(self, item: dict) -> dict:
+        """Add the pose target to one sample, keyed on its global frame index."""
+        idx = int(item["index"])
+        if idx >= len(self.valid):
+            # A store built for a different dataset would otherwise silently
+            # attach poses from the wrong frames.
+            raise IndexError(
+                f"frame index {idx} is outside the pose store ({len(self.valid)} "
+                f"frames). Store {self.path} does not match this dataset."
+            )
+        item[POSE_KEY] = self.values[idx]
+        item[VALID_KEY] = self.valid[idx]
+        return item
+
+
+def wrap_dataset(dataset, store: PoseStore):
+    """Make ``dataset[i]`` also return the pose target.
+
+    Retypes this one instance into a subclass that overrides ``__getitem__``.
+    Assigning ``dataset.__getitem__ = ...`` looks like it should work and does
+    nothing: Python resolves dunder methods on the *type*, so ``dataset[i]``
+    would keep calling the original and the samples would silently arrive
+    without the pose. Retyping affects only this object, not other datasets in
+    the process, and leaves LeRobot's class untouched.
+    """
+    if getattr(dataset, "_h2r_pose_wrapped", False):
+        return dataset
+
+    base = type(dataset)
+
+    class WithObjectPose(base):
+        def __getitem__(self, idx):
+            return store.attach(base.__getitem__(self, idx))
+
+    WithObjectPose.__name__ = f"{base.__name__}WithObjectPose"
+    dataset.__class__ = WithObjectPose
+    dataset._h2r_pose_wrapped = True
+    return dataset
+
+
+def install_from_env() -> None:
+    """Patch LeRobot's dataset factory when H2R_OBJECT_POSE is set.
+
+    Mirrors the inpainting hook in :mod:`h2r_il.train`: LeRobot's own factory is
+    left in place and its result is decorated, so nothing is forked.
+    """
+    spec = os.environ.get("H2R_OBJECT_POSE", "").strip()
+    if not spec:
+        return
+
+    target = os.environ.get("H2R_OBJECT_POSE_TARGET", "position").strip() or "position"
+    store = PoseStore(spec, target)
+
+    import lerobot.datasets.factory as _factory
+    import lerobot.scripts.lerobot_train as _lr_train
+
+    original = _factory.make_train_eval_datasets
+
+    def make_train_eval_datasets(*args, **kwargs):
+        result = original(*args, **kwargs)
+        datasets = result if isinstance(result, tuple) else (result,)
+        for ds in datasets:
+            if ds is not None and hasattr(ds, "__getitem__"):
+                wrap_dataset(ds, store)
+        return result
+
+    _factory.make_train_eval_datasets = make_train_eval_datasets
+    # train.py binds the name locally, so patching the factory module alone
+    # would not reach it.
+    if hasattr(_lr_train, "make_train_eval_datasets"):
+        _lr_train.make_train_eval_datasets = make_train_eval_datasets
