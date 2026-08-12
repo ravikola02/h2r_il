@@ -20,6 +20,11 @@ unset, this behaves exactly like ``lerobot-train``. The cache dir comes from
 ``H2R_RELATIVE_ANGLE_DIMS`` makes LeRobot's relative-action conversion angle-aware
 (see :mod:`h2r_il.relative_angles`); set it whenever ``--policy.use_relative_actions``
 is on and the action space contains Euler angles.
+
+``H2R_OBJECT_POSE`` points at a precomputed object-pose store and attaches a
+per-frame pose target to every sample (see :mod:`h2r_il.object_pose_inject`).
+All the perception ran up front, so this is a lookup by the frame index each
+sample already carries; the dataset on disk is untouched here too.
 """
 
 from __future__ import annotations
@@ -32,6 +37,7 @@ import lerobot.scripts.lerobot_train as _lr_train
 
 from h2r_il.relative_angles import install_from_env as _install_relative_angles
 from h2r_il.inpainting import build_pipeline
+from h2r_il.object_pose_inject import install_from_env as _install_object_pose
 
 
 def _install_inpainting() -> None:
@@ -62,6 +68,9 @@ def _install_inpainting() -> None:
 
 def main() -> None:
     _install_inpainting()
+    # After inpainting, so the pose wrapper decorates the already-patched factory
+    # and both hooks compose rather than one replacing the other.
+    _install_object_pose()
     _install_relative_angles()
     _lr_train.train()  # @parser.wrap(): parses sys.argv, runs LeRobot training
 

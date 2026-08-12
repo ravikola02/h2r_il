@@ -16,6 +16,10 @@ h2r_il/
 ├── src/h2r_il/
 │   ├── inpainting/     # annotation-driven frame manipulations (arm inpainting, ...)
 │   ├── relative_angles.py  # angle-aware relative-action conversion
+│   ├── object_pose.py  # 6-DoF object pose for one clip; pipeline sourced from v2d
+│   ├── object_pose_dataset.py  # dataset-scale: alignment, tracking, pose store
+│   ├── object_pose_inject.py   # attach the pose target to training samples
+│   ├── v2d_ext/        # modules bind-mounted into v2d's docker images
 │   ├── train.py        # lerobot-train wrapper that injects the above
 │   ├── policies/       # pi0/groot subclasses with aux losses (custom --policy.type)
 │   └── losses/         # auxiliary loss functions
@@ -56,8 +60,9 @@ the same dataset with identical hyperparameters, so the pair isolates the manipu
 | `raw` | the recorded frames, untouched — the baseline |
 | `inpaint` | the demonstrator's arm/hand inpainted out of every frame (`arm_inpaint`) |
 
-A third signal, **object grounding**, is still being explored and is not part of the
-training pipeline yet — see below.
+A third signal, **object grounding**, is now produced and attachable to training samples (see
+below). It is not a fourth row in that table: it adds a per-frame *target*, not a change to the
+frames, so it composes with either mode. The aux loss that consumes it is Phase 2.
 
 **Inpainting framework** (`src/h2r_il/inpainting/`). An *inpainting method* is a cache-backed, per-frame image manipulation. `InpaintingMethod` (base) handles tensor⇄numpy conversion (uint8/float, CHW/`(T,C,H,W)`, RGB), a content-addressed disk cache, and a registry; subclasses implement `apply(rgb_uint8) -> rgb_uint8`. New methods self-register with `@register_inpainting_method("name")` and are immediately usable everywhere.
 
@@ -143,13 +148,68 @@ observations always come from the recording, so errors do not compound the way a
 would. Reports per-dim MAE/RMSE/bias, a debiased MAE (is it just a frame shift?), a
 frozen-state baseline any useful policy must beat, and per-episode trajectory plots.
 
-**Object grounding (exploratory, not wired into training).** The third candidate signal is
-where the manipulated object is, per frame: open-vocabulary detection and segmentation
-(Grounding DINO → SAM2) give a 2D track, and a monocular depth + mesh + pose-tracking chain
-lifts it to 6-DoF object pose. Detection and segmentation track a clip reliably; the 6-DoF
-stage is the open part, since depth, mesh and metric scale are all estimated from a single
-view. If it lands, it feeds Phase 2 as an object-motion auxiliary loss rather than as
-another frame manipulation. Nothing here is on the training path today.
+**Object grounding — where the object is, per frame, as a 6-DoF pose.** The third signal, and
+unlike the other two it is a *target* rather than a frame manipulation. All the perception runs
+up front and training only reads a lookup table, so it costs nothing at dataloader time.
+
+`src/h2r_il/object_pose.py` produces the pose for one clip but **does not implement it**: the
+pipeline is sourced from the [video_to_data](https://github.com/nvidia-isaac/video_to_data)
+reconstruction modules (SAM2 masks → MoGe depth → SAM3D mesh → metric scale → FoundationPose
+tracking). No CAD model and no depth sensor. v2d is not vendored; it stays a separate checkout
+(`V2D_ROOT`) whose models all run in its own docker images.
+
+**One video, not one clip per episode.** A LeRobot v3 camera concatenates its episodes, in order,
+into one mp4 — so that file's frame index *is* the dataset's global frame index. Tracking the
+whole file once therefore gives one annotation pass, one SAM3D mesh and one metric-scale solve
+for the entire dataset, which is what makes poses comparable *across* episodes; a per-episode
+sweep re-estimates focal length per clip and lets absolute scale drift. `object_pose_dataset
+prepare` proves that identity (frame count against `total_frames`, and every episode's start
+timestamp against the running sum of lengths) and refuses to proceed if it is off by a frame.
+
+**Re-registration is the part that matters.** v2d's tracking step registers once and tracks
+everything after it, which is wrong here: at each episode cut the pose prior belongs to a
+different take. Left alone it lost the object just after the first cut and held a pose 12x too
+close for 98.7% of the dataset — while looking perfectly smooth, so step-continuity metrics
+could not see it. `object_pose_dataset track` re-registers at every episode boundary *and* every
+N frames within an episode (default 15). Validation uses MoGe depth inside the SAM2 mask, which
+is independent of FoundationPose; smoothness is not a quality metric.
+
+Result on kitting's head camera: 20613/20613 frames, 141/141 episodes, **0.48 cm median depth
+error**, zero degenerate frames.
+
+```bash
+# 1. verify frame alignment and stage the camera video for tagging
+uv run --no-sync python -m h2r_il.object_pose_dataset prepare --dataset-root <dataset>
+
+# 2. tag the object in v2d's SAM2 UI, then run the stock pipeline once to build
+#    the crop, masks, depth and mesh (its own poses are not the ones to keep)
+uv run --no-sync python -m h2r_il.object_pose --video <staged>.mp4 --out <run>
+
+# 3. re-track with the registration schedule, reusing every stage above
+uv run --no-sync python -m h2r_il.object_pose_dataset track --dataset-root <dataset>
+
+# 4. rebuild the trajectory, then place it on the dataset's global frame axis
+uv run --no-sync python -m h2r_il.object_pose --video <run>/../<stem>_crop.mp4 \
+    --crop none --reduce-only --out <run>
+uv run --no-sync python -m h2r_il.object_pose_dataset store --dataset-root <dataset>
+```
+
+**Injection into training** (`src/h2r_il/object_pose_inject.py`). Every LeRobot sample already
+carries its global frame index, and the store is dense on that axis, so attaching the target is
+one dict assignment per sample — no decoding, no I/O, ~2 MB resident. The dataset on disk is
+untouched, and LeRobot is not forked: its normalisation iterates its own configured features, so
+an extra key passes through, and the batch dict reaches the policy unchanged.
+
+```bash
+# Fine-tune with the object-pose target attached (works with ft_pi0.sh too):
+CONFIG=configs/kitting.env OBJECT_POSE=outputs/object_pose/kitting/head/store \
+    ./scripts/ft_groot.sh
+```
+
+`OBJECT_POSE_TARGET` is `position` (default, xyz) or `pose6d` (xyz + wxyz quaternion). Prefer
+position: rotation comes from an arbitrary SAM3D body frame and nothing here validates it — MoGe
+gives depth, not orientation. Every sample also carries `object_pose_valid`, and **the loss must
+mask on it**, or frames without a pose train the model towards a pose of all zeros.
 
 ### Phase 2 — auxiliary losses (next)
 
@@ -165,7 +225,12 @@ another frame manipulation. Nothing here is on the training path today.
 ## Open questions
 
 - Inpainting spec: how much to remove (hand/arm? forearm? shadows?) and per-camera behaviour
-- Object grounding: whether monocular 6-DoF object pose is accurate enough to train on
+- Object grounding: **translation** is measured (0.48 cm median depth error vs MoGe on kitting's
+  head camera), but **rotation is unvalidated** — MoGe gives depth, not orientation. Which is why
+  the default target is position-only. Also open: which cameras (only `head` is tracked; the wrist
+  cameras move with the arm, a different problem), and what exactly the loss regresses — absolute
+  position, per-step object motion, or a projected 2D keypoint. The store keeps raw poses so that
+  stays a load-time choice.
 - Annotation format and how annotations are stored/loaded alongside the LeRobot dataset
 - Aux loss definitions and where they attach in each model
 - Evaluation benchmark / robot setup

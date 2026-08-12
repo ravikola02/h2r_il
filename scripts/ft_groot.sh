@@ -50,10 +50,19 @@ fi
 #       --num-frames -1 --fill-cache --no-panels
 INPAINTING=${INPAINTING:-}
 
-if [[ -n "$INPAINTING" || -n "$RELATIVE_ANGLE_DIMS" ]]; then
+# Optional object-pose target. OBJECT_POSE points at a store built up front by
+# `object_pose_dataset track` + `store`; training only looks it up by the frame
+# index each sample already carries. OBJECT_POSE_TARGET is position (default) or
+# pose6d -- position only, because rotation comes from an arbitrary SAM3D body
+# frame that nothing in the pipeline validates.
+OBJECT_POSE=${OBJECT_POSE:-}
+
+if [[ -n "$INPAINTING" || -n "$RELATIVE_ANGLE_DIMS" || -n "$OBJECT_POSE" ]]; then
     if [[ -n "$INPAINTING" ]]; then export H2R_INPAINTING="$INPAINTING"; fi
     if [[ -n "${INPAINTING_CACHE:-}" ]]; then export H2R_INPAINTING_CACHE="$INPAINTING_CACHE"; fi
     if [[ -n "$RELATIVE_ANGLE_DIMS" ]]; then export H2R_RELATIVE_ANGLE_DIMS="$RELATIVE_ANGLE_DIMS"; fi
+    if [[ -n "$OBJECT_POSE" ]]; then export H2R_OBJECT_POSE="$OBJECT_POSE"; fi
+    if [[ -n "${OBJECT_POSE_TARGET:-}" ]]; then export H2R_OBJECT_POSE_TARGET="$OBJECT_POSE_TARGET"; fi
     ENTRY=(-m h2r_il.train)
 else
     ENTRY=(-m lerobot.scripts.lerobot_train)  # == the lerobot-train console script

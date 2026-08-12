@@ -46,10 +46,15 @@ fi
 #       --num-frames -1 --fill-cache --no-panels
 INPAINTING=${INPAINTING:-}
 
-if [[ -n "$INPAINTING" || -n "$RELATIVE_ANGLE_DIMS" ]]; then
+# Optional object-pose target; see the same block in ft_groot.sh.
+OBJECT_POSE=${OBJECT_POSE:-}
+
+if [[ -n "$INPAINTING" || -n "$RELATIVE_ANGLE_DIMS" || -n "$OBJECT_POSE" ]]; then
     if [[ -n "$INPAINTING" ]]; then export H2R_INPAINTING="$INPAINTING"; fi
     if [[ -n "${INPAINTING_CACHE:-}" ]]; then export H2R_INPAINTING_CACHE="$INPAINTING_CACHE"; fi
     if [[ -n "$RELATIVE_ANGLE_DIMS" ]]; then export H2R_RELATIVE_ANGLE_DIMS="$RELATIVE_ANGLE_DIMS"; fi
+    if [[ -n "$OBJECT_POSE" ]]; then export H2R_OBJECT_POSE="$OBJECT_POSE"; fi
+    if [[ -n "${OBJECT_POSE_TARGET:-}" ]]; then export H2R_OBJECT_POSE_TARGET="$OBJECT_POSE_TARGET"; fi
     ENTRY=(-m h2r_il.train)
 else
     ENTRY=(-m lerobot.scripts.lerobot_train)  # == the lerobot-train console script
