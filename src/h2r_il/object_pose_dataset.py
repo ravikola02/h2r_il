@@ -53,8 +53,10 @@ from h2r_il.object_pose import (
     DEFAULT_CROP,
     DEFAULT_CROP_FOR,
     REPO_DIR,
+    WEIGHTS,
     probe_size,
     read_local_env,
+    resolve_v2d_root,
 )
 
 DEFAULT_CAMERA = "observation.images.head"
@@ -433,6 +435,99 @@ def command_prepare(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_track(args: argparse.Namespace) -> int:
+    """FoundationPose over the whole camera video, re-registering on a schedule.
+
+    v2d's own step 8 registers once and tracks everything after it, which is
+    wrong for a concatenated dataset: at each episode cut the pose prior belongs
+    to a different take. On kitting that lost the object just after the first cut
+    and held a pose 12x too close for 98.7% of the dataset.
+
+    Two changes, both measured against MoGe depth (independent of FoundationPose):
+      * register at every episode boundary -- the cut is known, no need to infer it;
+      * register every N frames within an episode -- error grows between
+        registrations, and N=15 cut median error ~3x on 2 of 3 test episodes and
+        won p90 on all 3, at ~50% more wall time.
+
+    Sparse schedules are worse than none: N=60 left 15.4% of frames >10 cm off,
+    because a failed registration then stands for 60 frames. Either register
+    often or not at all.
+    """
+    dataset_root = resolve_dataset_root(args.dataset_root)
+    info = load_info(dataset_root)
+    episodes = load_episodes(dataset_root)
+    resolve_camera_video(dataset_root, info, episodes, args.camera)   # re-validate
+
+    work_dir = Path(args.work_dir).expanduser().absolute() if args.work_dir \
+        else default_work_dir(dataset_root, args.camera)
+    run_dir = Path(args.out).expanduser().absolute() if args.out else work_dir / "run"
+    stem = f"{dataset_name(dataset_root)}_{args.camera.rsplit('.', 1)[-1]}"
+    video = work_dir / f"{stem}_crop.mp4"
+    if not video.is_file():
+        sys.exit(f"no cropped video at {video}. Run `prepare`, then tag and track "
+                 "once with h2r_il.object_pose to produce the crop and prompts.")
+    for required in ("depth", "masks", "intrinsics", "scaled_mesh.glb"):
+        if not (run_dir / required).exists():
+            sys.exit(f"{run_dir / required} missing; this step reuses the earlier "
+                     "stages' outputs and cannot rebuild them.")
+
+    lengths = episodes["length"].to_numpy()
+    starts = (lengths.cumsum() - lengths)[1:]        # frame 0 is the reference
+    v2d_root = resolve_v2d_root()
+
+    module_src = Path(__file__).resolve().parent / "v2d_ext" / "run_episodes.py"
+    container_module = "/workspace/v2d_foundation_pose/lib/run_episodes.py"
+
+    sys.path.insert(0, str(v2d_root / "reconstruction" / "modules"))
+    sys.path.insert(0, str(v2d_root / "reconstruction"))
+    os.chdir(v2d_root / "reconstruction")
+    from v2d.docker.container import run_in_container   # noqa: E402
+
+    weights = WEIGHTS["foundation_pose"]
+    weights_container = f"/data/weights_dir/{os.path.basename(os.path.abspath(weights))}"
+
+    print(f"tracking {video.name}: {len(starts)} episode boundaries"
+          + (f", plus every {args.register_every} frames" if args.register_every else ""))
+    run_in_container(
+        image="v2d_foundation_pose",
+        module="v2d.foundation_pose.lib.run_episodes",
+        inputs={
+            "video_path": str(video),
+            "depth_folder": str(run_dir / "depth"),
+            "masks_folder": str(run_dir / "masks" / str(args.object_id)),
+            "camera_intrinsics_path": str(run_dir / "intrinsics" / "000000.json"),
+            "mesh_path": str(run_dir / "scaled_mesh.glb"),
+            "weights_dir": weights,
+        },
+        outputs={"poses_dir": str(run_dir / "poses")},
+        extra_args={
+            "reference_frame": 0,
+            "register_frames": ",".join(str(int(s)) for s in starts),
+            "register_every": args.register_every,
+            "register_iteration": 10,
+            "track_iteration": 5,
+            # Measured worse: constraining rotation pushes orientation error into
+            # translation (median 2-3x worse on every test episode). For a
+            # position-only target, drop rotation when building the target
+            # instead -- the store keeps raw poses precisely so that stays a
+            # downstream choice.
+            "fix_rotation": args.fix_rotation,
+        },
+        gpus=True,
+        env={"FOUNDATIONPOSE_WEIGHTS_DIR": weights_container},
+        # Single-file mount: the image's compiled FoundationPose CUDA extensions
+        # live under /workspace and a full dev mount would hide them.
+        extra_volumes=[f"{module_src}:{container_module}:ro"],
+    )
+    print(f"\nposes -> {run_dir / 'poses'}")
+    print("Next: rebuild the trajectory, then place it on the dataset's frame axis:")
+    print(f"    python -m h2r_il.object_pose --video {video} --crop none "
+          f"--reduce-only --out {run_dir}")
+    print(f"    python -m h2r_il.object_pose_dataset store "
+          f"--dataset-root {dataset_root} --camera {args.camera}")
+    return 0
+
+
 def command_store(args: argparse.Namespace) -> int:
     dataset_root = resolve_dataset_root(args.dataset_root)
     info = load_info(dataset_root)
@@ -540,6 +635,9 @@ def build_parser() -> argparse.ArgumentParser:
     for name, handler, help_text in (
         ("prepare", command_prepare,
          "Verify frame alignment and stage the camera video for tagging."),
+        ("track", command_track,
+         "FoundationPose over the camera video, re-registering at episode "
+         "boundaries and on a periodic schedule."),
         ("store", command_store,
          "Place a tracked trajectory onto the dataset's global frame axis."),
         ("status", command_status, "What has been produced so far."),
@@ -551,6 +649,19 @@ def build_parser() -> argparse.ArgumentParser:
                          help=f"Video feature to track. Default: {DEFAULT_CAMERA}")
         sub.add_argument("--work-dir", help="Where to stage. Default: "
                                             "outputs/object_pose/<dataset>/<camera>")
+        if name == "track":
+            sub.add_argument("--out", help="Run directory holding depth/masks/"
+                                           "intrinsics/mesh. Default: <work-dir>/run")
+            sub.add_argument("--object-id", type=int, default=0,
+                             help="Which mask subdirectory to track. Default 0.")
+            sub.add_argument("--register-every", type=int, default=15,
+                             help="Re-register every N frames within an episode, on "
+                                  "top of the episode boundaries. 0 disables. "
+                                  "Default 15 (measured; see the command help).")
+            sub.add_argument("--fix-rotation", action="store_true",
+                             help="Force rotation to identity while tracking. "
+                                  "Measured WORSE (translation error 2-3x): prefer "
+                                  "dropping rotation when building the target.")
         if name == "store":
             sub.add_argument("--trajectory", help="trajectory.npz to place. "
                                                   "Default: <work-dir>/run/trajectory.npz")
