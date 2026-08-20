@@ -63,6 +63,13 @@ if [[ -n "$INPAINTING" || -n "$RELATIVE_ANGLE_DIMS" || -n "$OBJECT_POSE" ]]; the
     if [[ -n "$RELATIVE_ANGLE_DIMS" ]]; then export H2R_RELATIVE_ANGLE_DIMS="$RELATIVE_ANGLE_DIMS"; fi
     if [[ -n "$OBJECT_POSE" ]]; then export H2R_OBJECT_POSE="$OBJECT_POSE"; fi
     if [[ -n "${OBJECT_POSE_TARGET:-}" ]]; then export H2R_OBJECT_POSE_TARGET="$OBJECT_POSE_TARGET"; fi
+    # Poses for the whole action chunk, so the pose channel is a trajectory rather
+    # than a constant. Must be >= the policy's chunk_size or the tail of every
+    # chunk goes unsupervised (the policy warns once if it is short). GR00T's
+    # chunk_size defaults to 40; override CHUNK_SIZE and this together.
+    if [[ -n "$OBJECT_POSE" ]]; then
+        export H2R_OBJECT_POSE_HORIZON="${OBJECT_POSE_HORIZON:-${CHUNK_SIZE:-40}}"
+    fi
     ENTRY=(-m h2r_il.train)
 else
     ENTRY=(-m lerobot.scripts.lerobot_train)  # == the lerobot-train console script
@@ -92,9 +99,7 @@ if [[ -n "$OBJECT_POSE" && "${OBJECT_POSE_HEAD:-1}" != "0" ]]; then
     EXTRA_ARGS+=(--policy.object_pose_store="$OBJECT_POSE")
     EXTRA_ARGS+=(--policy.object_pose_weight="${OBJECT_POSE_WEIGHT:-1.0}")
     EXTRA_ARGS+=(--policy.object_pose_target="${OBJECT_POSE_TARGET:-position}")
-    if [[ "${OBJECT_POSE_DETACH:-0}" != "0" ]]; then
-        EXTRA_ARGS+=(--policy.object_pose_detach=true)
-    fi
+    if [[ -n "${CHUNK_SIZE:-}" ]]; then EXTRA_ARGS+=(--policy.chunk_size="$CHUNK_SIZE"); fi
 fi
 
 exec "${TRAIN[@]}" \

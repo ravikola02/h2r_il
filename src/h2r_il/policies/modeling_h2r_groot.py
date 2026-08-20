@@ -1,64 +1,99 @@
-"""GR00T + object-pose head. See :mod:`h2r_il.policies.configuration_h2r_groot`.
+"""GR00T with the object pose carried in its action head's unused output dims.
 
-GR00T's ``forward`` hands the whole batch to the vendored Isaac model and returns
-only a loss, so the tap is a forward hook on ``model.backbone``. That module
-returns ``backbone_features`` (B, T, backbone_embedding_dim) with a matching
-``backbone_attention_mask`` -- the fused vision-language sequence the action head
-cross-attends to, which is the GR00T counterpart of pi0's prefix.
+GR00T pads actions to ``max_action_dim`` (132) and zeroes everything past the real
+action width in ``action_mask``; the DiT emits all 132 channels regardless. The
+object pose goes into the first free ones. No new module, no new parameter, and no
+extra compute -- those channels were already being predicted and discarded.
 
-The hook is placed *before* the action head's own ``vlln``/self-attention stage,
-so the aux gradient lands on the backbone rather than on the action head's private
-re-encoding of it. Shaping the trunk is the point.
+Three facts about GR00T's internals make this work:
+
+* ``action_mask`` is a float multiplier, not a boolean, and it is the only thing
+  deciding which dimensions are supervised (``action_loss = mse(...) *
+  action_mask``). Enabling a channel means writing a nonzero entry into it.
+* the action head returns the *per-element* ``action_loss`` and the mask it used
+  alongside the scalar, so the pose channel's contribution can be separated back
+  out and given its own weight rather than being averaged in at whatever share of
+  the dimensions it happens to occupy.
+* ``GrootPolicy.forward`` hands one dict to ``self._groot_model.forward``, and that
+  dict already holds the processed ``action`` and ``action_mask``. Wrapping that
+  call is a single seam for both the write on the way in and the read on the way
+  out.
+
+The supervision is a *velocity* target, not a pose: GR00T's action head is a flow
+matching DiT, so these channels learn the pose's velocity field along the noise
+path and the pose is recovered by denoising. The aux gradient therefore reaches
+the vision backbone through the DiT and the VL self-attention rather than landing
+on the trunk directly.
 """
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from torch import Tensor
 
+from lerobot.utils.constants import ACTION
 from lerobot.policies.groot.modeling_groot import GrootPolicy
 
 from h2r_il.policies.configuration_h2r_groot import H2RGrootConfig
-from h2r_il.policies.object_pose_head import ObjectPoseAuxMixin
+from h2r_il.policies.object_pose_slots import ObjectPoseSlotsMixin
+
+logger = logging.getLogger(__name__)
 
 
-class H2RGrootPolicy(ObjectPoseAuxMixin, GrootPolicy):
+class H2RGrootPolicy(ObjectPoseSlotsMixin, GrootPolicy):
     name = "h2r_groot"
     config_class = H2RGrootConfig
 
     def __init__(self, config: H2RGrootConfig, **kwargs):
         super().__init__(config, **kwargs)
-        self._setup_object_pose_aux(self._backbone_feature_dim())
-        self._install_backbone_capture()
+        action_dim = config.output_features[ACTION].shape[0]
+        self._setup_object_pose_slots(action_dim, config.max_action_dim)
+        self._install_action_hook()
 
-    def _backbone_feature_dim(self) -> int:
-        model_config = getattr(self._groot_model, "config", None)
-        dim = getattr(model_config, "backbone_embedding_dim", None)
-        if dim is None:
-            raise RuntimeError(
-                "cannot determine GR00T's backbone_embedding_dim; the head's input "
-                "width would be a guess and a wrong guess fails only at the first "
-                "batch, after the model is loaded."
-            )
-        return int(dim)
+    def _install_action_hook(self) -> None:
+        """Wrap the inner model's forward: write the target in, capture the loss out."""
+        model = self._groot_model
+        original = model.forward
 
-    def _install_backbone_capture(self) -> None:
-        backbone = getattr(self._groot_model, "backbone", None)
-        if backbone is None:
-            raise RuntimeError("GR00T model exposes no `backbone` module to hook.")
+        def wrapped(inputs, *args, **kwargs):
+            self._inject_pose(inputs)
+            outputs = original(inputs, *args, **kwargs)
+            self._captured = (outputs.get("action_loss"), outputs.get("action_mask"))
+            return outputs
 
-        def capture(_module, _inputs, output):
-            features = output["backbone_features"]
-            mask = output.get("backbone_attention_mask")
-            self._captured_features = (features, mask)
+        model.forward = wrapped
 
-        # Kept so the hook can be removed in tests; the handle is not needed in
-        # normal training, where the policy and the hook have the same lifetime.
-        self._object_pose_hook = backbone.register_forward_hook(capture)
+    def _inject_pose(self, inputs: dict[str, Tensor]) -> None:
+        """Write the pose into the spare action dims and open their mask entries."""
+        action, mask = inputs.get("action"), inputs.get("action_mask")
+        if action is None or mask is None:
+            return                                  # inference path: nothing to supervise
+        inputs["action"] = self._write_pose_into_actions(action)
+        # The mask arrives with the pose columns zeroed, so without this the
+        # channel is written and then multiplied out of existence.
+        inputs["action_mask"] = torch.maximum(mask, self._pose_weights(mask))
 
     def forward(self, batch: dict[str, Tensor], **kwargs) -> tuple[Tensor, dict]:
-        loss, loss_dict = super().forward(batch, **kwargs)
-        # GR00T runs its trunk under bf16 autocast; the head's own cast is inside
-        # ObjectPoseHead.forward, so nothing extra is needed here beyond letting
-        # the loss come back in the base loss's dtype.
-        return self._add_object_pose_loss(loss, loss_dict, batch)
+        self._pending_batch = batch
+        self._captured = (None, None)
+        try:
+            _, loss_dict = super().forward(batch, **kwargs)
+        finally:
+            self._pending_batch = None
+
+        per_element, mask = self._captured
+        if per_element is None or mask is None:
+            raise RuntimeError(
+                "GR00T did not return 'action_loss'/'action_mask'. The h2r_groot "
+                "loss is recomposed from them, so it cannot fall back to the "
+                "scalar without silently dropping the pose term's weight."
+            )
+
+        # Recompose rather than use GR00T's own scalar: its reduction averages
+        # the action and pose channels under one shared denominator. See
+        # ObjectPoseSlotsMixin._recompose_losses.
+        total, metrics = self._recompose_losses(per_element, mask)
+        loss_dict.update(metrics)
+        return total, loss_dict

@@ -23,8 +23,17 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 class H2RGrootConfig(GrootConfig):
     """GR00T N1.7, plus a head that regresses where the manipulated object is."""
 
+    # Weight on the pose channel, relative to the action loss. Each term is
+    # normalised over its own elements, so this is a true weight rather than a
+    # share of however many action dimensions the embodiment happens to have --
+    # and 0.0 reproduces stock GR00T's loss exactly.
     object_pose_weight: float = 1.0
+
+    # "position" (xyz) or "pose6d" (xyz + wxyz). Prefer position: the rotation in
+    # the store comes from an arbitrary SAM3D body frame and nothing validates it.
     object_pose_target: str = "position"
-    object_pose_hidden_dim: int = 512
+
+    # Pose store, used ONLY to standardise the target at construction; the targets
+    # themselves arrive per-sample in the batch. Without it the pose channel holds
+    # raw metres beside unit-scale actions and is a rounding error in the loss.
     object_pose_store: str | None = None
-    object_pose_detach: bool = False

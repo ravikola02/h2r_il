@@ -166,6 +166,14 @@ class ObjectPoseAuxMixin:
         prediction = self.object_pose_head(features, mask)
         target = batch[POSE_KEY]
         valid = batch.get(VALID_KEY)
+        if target.dim() == 3:
+            # A horizon window (B, H, dim) arrives when H2R_OBJECT_POSE_HORIZON is
+            # set for the GR00T slot design. This head regresses a single pose, so
+            # take the observed frame and leave the rest; without this the shapes
+            # would broadcast into a silently meaningless loss.
+            target = target[:, 0]
+            if valid is not None:
+                valid = valid[:, 0]
         if valid is None:
             valid = torch.ones(target.shape[0], dtype=torch.bool, device=target.device)
 

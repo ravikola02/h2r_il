@@ -247,26 +247,53 @@ path (`_get_policy_cls_from_policy_name`), which resolves the policy and process
 naming conventions — so no fork and no patched factory, but the config class name, module name
 and registered type have to stay in step.
 
-*Where the head taps.* pi0: `PI0Pytorch.embed_prefix`, the concatenated image + language
-embeddings the action expert cross-attends to, captured by wrapping the bound method on that one
-instance. GR00T: a forward hook on `model.backbone`, whose `backbone_features` are the same
-thing one stage earlier than the action head's private re-encoding. Both give `(B, T, D)` plus a
-padding mask; the head masked-mean-pools and runs a small MLP. Gradients are **not** detached, so
-the aux loss shapes the shared trunk — that is the entire point. `--policy.object_pose_detach`
-turns it into a passive probe that measures whether position is already encoded without changing
-anything, which is a diagnostic, not a training signal.
+**GR00T — the pose rides in the action head's unused output dimensions.** GR00T pads actions to
+`max_action_dim=132` and zeroes everything past the real action width in `action_mask`, while the
+DiT emits all 132 channels every forward pass. On kitting the action is 14 wide, so 118 channels
+are already computed and discarded. The object pose goes into the first three of them: **no new
+module, no new parameter, nothing added to the state dict, and no extra compute.**
 
-*Two things the loss has to get right.* It **masks on `object_pose_valid`** — frames without a
-pose carry zeros, and zero sits in the middle of the coordinate range, so averaging over them
-actively pulls the prediction towards the origin. And it **standardises the target** using
-statistics from the store: raw positions are metres, with a variance of 0.017 on kitting, so an
-unnormalised aux term is ~50× smaller than the flow-matching loss and `object_pose_weight` would
-be silently doing unit conversion instead of expressing a preference. Reported metrics are in
-centimetres, comparable with the 0.48 cm the tracker itself was measured at.
+Three properties of GR00T's internals make it work. `action_mask` is a float multiplier and the
+only thing deciding which dims are supervised (`action_loss = mse(...) * action_mask`), so
+enabling a channel is a mask write. The action head returns the *per-element* `action_loss` and
+its mask alongside the scalar, so the pose term can be separated back out and given its own
+weight. And `GrootPolicy.forward` passes one dict to `self._groot_model.forward` already holding
+the processed `action` and `action_mask` — a single seam for the write in and the capture out.
+
+The loss is recomposed rather than taken from GR00T's scalar, because that scalar averages action
+and pose channels under one shared denominator, which would make the pose's influence depend on
+how many action dims the embodiment happens to have. Each term is normalised over its own
+elements — so `object_pose_weight` is a true weight, and **`object_pose_weight=0` reproduces stock
+GR00T's loss exactly** (its denominator is precisely the action-only one), which makes the
+ablation exact rather than approximate.
+
+*The channel is a trajectory, not a constant.* The action tensor is `(B, chunk, 132)`, and the
+store is dense on the global frame index, so step *t* of the chunk gets the object's pose at the
+frame action *t* acts on. `H2R_OBJECT_POSE_HORIZON` controls how many poses are attached; windows
+are cut at episode boundaries (the video is one concatenated file, so index+1 past an episode's
+last frame is a different take) and everything past the cut arrives zeroed and masked. Writing
+one pose across the whole chunk was not an option — it would teach the model the object is
+stationary while it acts.
+
+*What it costs.* The supervision is a **velocity** target, not a pose: the head is a flow-matching
+DiT, so these channels learn the pose's velocity field along the noise path and the pose is only
+recoverable by denoising. The aux gradient therefore reaches the vision backbone through the DiT
+and the VL self-attention rather than landing on the trunk directly — a weaker, noisier path than
+a dedicated head, which is the price of zero parameters.
+
+*Two things it still has to get right.* It **masks on validity** — uncovered frames carry zeros,
+and zero sits mid-range, so training on them pulls the prediction towards the origin. And it
+**standardises the target** from store statistics: raw positions are metres while the actions
+sharing those channels arrive normalised to roughly unit scale, so raw metres would be a rounding
+error in a shared loss.
+
+**pi0 is still on the earlier separate-head design** (`src/h2r_il/policies/object_pose_head.py`) —
+converting it to the same spare-dimension scheme is the next step. pi0 pads to `max_action_dim=32`
+and truncates its loss to the real action width, so the same 18 free channels are there.
 
 ```bash
-# GR00T + object-pose head. OBJECT_POSE both attaches the target and switches the
-# policy type; OBJECT_POSE_WEIGHT tunes it, OBJECT_POSE_HEAD=0 opts out of the head.
+# GR00T + object-pose channel. OBJECT_POSE both attaches the target and switches the
+# policy type; OBJECT_POSE_WEIGHT tunes it (0 == stock GR00T), OBJECT_POSE_HEAD=0 opts out.
 CONFIG=configs/kitting.env OBJECT_POSE=outputs/object_pose/kitting/head/store \
     OBJECT_POSE_WEIGHT=1.0 ./scripts/ft_groot.sh
 ```
@@ -283,7 +310,8 @@ CONFIG=configs/kitting.env PRETRAINED=outputs/staged/<name> \
     OBJECT_POSE=outputs/object_pose/kitting/head/store ./scripts/ft_pi0.sh
 ```
 
-`scripts/test_object_pose_head.py` covers the parts that fail quietly — target survival through
+`scripts/test_object_pose_slots.py` (GR00T) and `scripts/test_object_pose_head.py` (pi0) cover
+the parts that fail quietly — target survival through
 the processor pipeline, masking, the all-invalid batch, gradient reaching the trunk, and the
 standardisation — without needing a GPU or model weights.
 

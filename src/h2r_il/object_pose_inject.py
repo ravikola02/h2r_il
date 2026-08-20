@@ -57,7 +57,8 @@ logger = logging.getLogger(__name__)
 class PoseStore:
     """Dense per-frame object poses, looked up by global dataset frame index."""
 
-    def __init__(self, path: str | Path, target: str = "position") -> None:
+    def __init__(self, path: str | Path, target: str = "position",
+                 horizon: int = 1) -> None:
         path = Path(path).expanduser()
         if path.is_dir():
             path = path / "object_pose.npz"
@@ -69,7 +70,12 @@ class PoseStore:
         data = np.load(path)
         self.path = path
         self.target = target
+        self.horizon = max(1, int(horizon))
         self.valid = torch.from_numpy(data["valid"].astype(np.bool_))
+        # Needed to stop a horizon window from walking past an episode cut: the
+        # video is one concatenated file, so index+1 past the last frame of an
+        # episode is a different take entirely, and its pose is unrelated.
+        self.episode_index = torch.from_numpy(data["episode_index"].astype(np.int64))
 
         position = data["position"].astype(np.float32)
         if target == "position":
@@ -84,8 +90,10 @@ class PoseStore:
         self.dim = self.values.shape[1]
         covered = int(self.valid.sum())
         logger.info(
-            "object pose store %s: %d/%d frames covered (%.1f%%), target=%s, dim=%d",
-            path, covered, len(self.valid), 100 * covered / len(self.valid), target, self.dim
+            "object pose store %s: %d/%d frames covered (%.1f%%), target=%s, dim=%d, "
+            "horizon=%d",
+            path, covered, len(self.valid), 100 * covered / len(self.valid), target,
+            self.dim, self.horizon
         )
 
     def __len__(self) -> int:
@@ -101,8 +109,31 @@ class PoseStore:
                 f"frame index {idx} is outside the pose store ({len(self.valid)} "
                 f"frames). Store {self.path} does not match this dataset."
             )
-        item[POSE_KEY] = self.values[idx]
-        item[VALID_KEY] = self.valid[idx]
+        if self.horizon == 1:
+            item[POSE_KEY] = self.values[idx]
+            item[VALID_KEY] = self.valid[idx]
+            return item
+
+        # A window of poses aligned with the policy's action chunk: step t is the
+        # object's pose at the frame that action t acts on.
+        stop = min(idx + self.horizon, len(self.valid))
+        values = self.values[idx:stop]
+        # Same episode only. Frames beyond the cut are dropped rather than
+        # clamped: repeating the last pose would look like a stationary object.
+        valid = self.valid[idx:stop] & (self.episode_index[idx:stop] == self.episode_index[idx])
+
+        # Zero what the mask rejects, matching the store's own convention that an
+        # uncovered frame is zeros. Everything downstream masks anyway; this just
+        # removes the chance that a future consumer which forgets to reads a real
+        # pose from the *next* episode and never notices.
+        values = values * valid.unsqueeze(-1).to(values.dtype)
+
+        missing = self.horizon - values.shape[0]
+        if missing > 0:                       # near the end of the dataset
+            values = torch.cat([values, values.new_zeros(missing, self.dim)])
+            valid = torch.cat([valid, valid.new_zeros(missing)])
+        item[POSE_KEY] = values               # (horizon, dim)
+        item[VALID_KEY] = valid               # (horizon,)
         return item
 
 
@@ -142,7 +173,11 @@ def install_from_env() -> None:
         return
 
     target = os.environ.get("H2R_OBJECT_POSE_TARGET", "position").strip() or "position"
-    store = PoseStore(spec, target)
+    # Poses for the whole action chunk, not just the observed frame. Set this at
+    # least as large as the policy's chunk_size; the policy slices what it needs
+    # and masks any shortfall, so over-covering is free (50 x 3 floats a sample).
+    horizon = int(os.environ.get("H2R_OBJECT_POSE_HORIZON", "1") or 1)
+    store = PoseStore(spec, target, horizon=horizon)
 
     import lerobot.datasets.factory as _factory
     import lerobot.scripts.lerobot_train as _lr_train
