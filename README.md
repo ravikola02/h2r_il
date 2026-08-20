@@ -178,21 +178,41 @@ Result on kitting's head camera: 20613/20613 frames, 141/141 episodes, **0.48 cm
 error**, zero degenerate frames.
 
 ```bash
-# 1. verify frame alignment and stage the camera video for tagging
-uv run --no-sync python -m h2r_il.object_pose_dataset prepare --dataset-root <dataset>
+# what it would do, and roughly how long, without doing it
+uv run --no-sync python -m h2r_il.object_pose_dataset build \
+    --dataset-root <dataset> --dry-run
 
-# 2. tag the object in v2d's SAM2 UI, then run the stock pipeline once to build
-#    the crop, masks, depth and mesh (its own poses are not the ones to keep)
-uv run --no-sync python -m h2r_il.object_pose --video <staged>.mp4 --out <run>
-
-# 3. re-track with the registration schedule, reusing every stage above
-uv run --no-sync python -m h2r_il.object_pose_dataset track --dataset-root <dataset>
-
-# 4. rebuild the trajectory, then place it on the dataset's global frame axis
-uv run --no-sync python -m h2r_il.object_pose --video <run>/../<stem>_crop.mp4 \
-    --crop none --reduce-only --out <run>
-uv run --no-sync python -m h2r_il.object_pose_dataset store --dataset-root <dataset>
+# build the lookup table
+uv run --no-sync python -m h2r_il.object_pose_dataset build --dataset-root <dataset>
 ```
+
+`build` runs five stages — `prepare` (verify alignment, stage the video),
+`reconstruct` (v2d's stock pipeline: crop, masks, depth, mesh, metric scale),
+`track` (re-registration), `reduce` (poses → trajectory + overlay), `store` (place on
+the global frame axis) — as separate processes, skipping any whose output is already on
+disk and current. So it is the resume command as well as the start command: after a
+crash, or after re-running one stage by hand with different arguments, calling it again
+does exactly the outstanding work. Staleness is decided by mtime against the stage's own
+input, not by a state file that could disagree with the disk.
+
+It stops once, at the one genuinely manual step — tagging the object in v2d's SAM2 UI —
+printing the command to run and exiting **2**. Re-run `build` afterwards and it continues
+from there.
+
+Budget on kitting's head camera: **~7 h** of GPU for a cold build (`--dry-run` scales the
+estimate to your dataset's frame count). Roughly 1.7 h of that is waste — v2d's
+`run_pipeline` is monolithic, so `reconstruct` also runs a register-once FoundationPose
+pass whose poses `track` then replaces, and there is no stage selector to skip it. Paid
+once per dataset+camera; every training run afterwards just reads the 2 MB table.
+
+The individual subcommands (`prepare`, `track`, `store`) are what `build` shells out to
+and remain available for exactly that re-run-one-stage case.
+
+`track --fix-rotation` (also `build --fix-rotation`) forces rotation to identity during
+tracking. It is measured **worse** — translation error 2–3× on every episode tested,
+because denying FoundationPose rotation makes it slide translation to maximise mesh/depth
+overlap. Kept because the measurement is worth being able to repeat at full-dataset
+scale; both commands warn when it is on.
 
 **Injection into training** (`src/h2r_il/object_pose_inject.py`). Every LeRobot sample already
 carries its global frame index, and the store is dense on that axis, so attaching the target is
