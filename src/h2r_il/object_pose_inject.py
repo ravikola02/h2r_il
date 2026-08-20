@@ -28,9 +28,9 @@ an arbitrary SAM3D body frame and nothing in this pipeline validates it (MoGe
 gives depth, not orientation). ``pose6d`` emits xyz + wxyz quaternion for when
 that changes.
 
-Every sample gets ``object_pose_valid``. Frames with no pose emit zeros with the
-flag false, and **the loss must mask on it** -- otherwise uncovered frames train
-the model towards a pose of all zeros.
+Every sample gets ``observation.object_pose_valid``. Frames with no pose emit zeros
+with the flag false, and **the loss must mask on it** -- otherwise uncovered frames
+train the model towards a pose of all zeros.
 """
 
 from __future__ import annotations
@@ -42,8 +42,14 @@ from pathlib import Path
 import numpy as np
 import torch
 
-POSE_KEY = "object_pose"
-VALID_KEY = "object_pose_valid"
+# LeRobot's processor pipeline runs between the dataloader and the policy
+# (`batch = preprocessor(batch)` in lerobot_train). Its dict->transition converter
+# keeps only keys under the "observation." prefix plus a fixed whitelist, and drops
+# everything else -- so a bare "object_pose" key survives collation, looks correct
+# in any dataloader-level test, and is silently gone by the time forward() runs.
+# The prefix is what makes the target reach the policy at all.
+POSE_KEY = "observation.object_pose"
+VALID_KEY = "observation.object_pose_valid"
 
 logger = logging.getLogger(__name__)
 

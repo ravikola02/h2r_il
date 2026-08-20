@@ -217,8 +217,15 @@ scale; both commands warn when it is on.
 **Injection into training** (`src/h2r_il/object_pose_inject.py`). Every LeRobot sample already
 carries its global frame index, and the store is dense on that axis, so attaching the target is
 one dict assignment per sample — no decoding, no I/O, ~2 MB resident. The dataset on disk is
-untouched, and LeRobot is not forked: its normalisation iterates its own configured features, so
-an extra key passes through, and the batch dict reaches the policy unchanged.
+untouched and LeRobot is not forked.
+
+The target is attached as **`observation.object_pose`**, and the prefix is not cosmetic.
+`lerobot_train` runs `batch = preprocessor(batch)` between the dataloader and the policy, and
+that pipeline's dict→transition converter keeps only `observation.`-prefixed keys plus a fixed
+whitelist — everything else is dropped silently. A bare `object_pose` key survives collation and
+looks correct in any dataloader-level test, then is simply gone by the time `forward` runs.
+Under the prefix it reaches the policy, and the normalizer passes it through untouched because
+it has no feature spec for it.
 
 ```bash
 # Fine-tune with the object-pose target attached (works with ft_pi0.sh too):
@@ -231,10 +238,57 @@ position: rotation comes from an arbitrary SAM3D body frame and nothing here val
 gives depth, not orientation. Every sample also carries `object_pose_valid`, and **the loss must
 mask on it**, or frames without a pose train the model towards a pose of all zeros.
 
-### Phase 2 — auxiliary losses (next)
+### Phase 2 — auxiliary losses
 
-- Policy subclasses registered as custom policy types (e.g. `pi0_h2r`, `groot_h2r`) that add aux loss terms to the training objective
-- Loss weights and toggles switchable from config, so baselines and variants share one script
+**Object-pose prediction heads** (`src/h2r_il/policies/`, `src/h2r_il/losses/object_pose.py`).
+`--policy.type=h2r_pi0` and `h2r_groot` are pi0 and GR00T with a head that regresses the object's
+position from the backbone's own features. They register through LeRobot's third-party plugin
+path (`_get_policy_cls_from_policy_name`), which resolves the policy and processor classes from
+naming conventions — so no fork and no patched factory, but the config class name, module name
+and registered type have to stay in step.
+
+*Where the head taps.* pi0: `PI0Pytorch.embed_prefix`, the concatenated image + language
+embeddings the action expert cross-attends to, captured by wrapping the bound method on that one
+instance. GR00T: a forward hook on `model.backbone`, whose `backbone_features` are the same
+thing one stage earlier than the action head's private re-encoding. Both give `(B, T, D)` plus a
+padding mask; the head masked-mean-pools and runs a small MLP. Gradients are **not** detached, so
+the aux loss shapes the shared trunk — that is the entire point. `--policy.object_pose_detach`
+turns it into a passive probe that measures whether position is already encoded without changing
+anything, which is a diagnostic, not a training signal.
+
+*Two things the loss has to get right.* It **masks on `object_pose_valid`** — frames without a
+pose carry zeros, and zero sits in the middle of the coordinate range, so averaging over them
+actively pulls the prediction towards the origin. And it **standardises the target** using
+statistics from the store: raw positions are metres, with a variance of 0.017 on kitting, so an
+unnormalised aux term is ~50× smaller than the flow-matching loss and `object_pose_weight` would
+be silently doing unit conversion instead of expressing a preference. Reported metrics are in
+centimetres, comparable with the 0.48 cm the tracker itself was measured at.
+
+```bash
+# GR00T + object-pose head. OBJECT_POSE both attaches the target and switches the
+# policy type; OBJECT_POSE_WEIGHT tunes it, OBJECT_POSE_HEAD=0 opts out of the head.
+CONFIG=configs/kitting.env OBJECT_POSE=outputs/object_pose/kitting/head/store \
+    OBJECT_POSE_WEIGHT=1.0 ./scripts/ft_groot.sh
+```
+
+pi0 needs one extra step. It loads weights through `--policy.path`, and LeRobot takes the policy
+class from that checkpoint's `config.json` (it pops `type` before applying CLI overrides), so
+`--policy.type` cannot switch it. Re-stage the checkpoint once — the h2r configs are supersets,
+so an existing config parses unchanged and only the head starts fresh:
+
+```bash
+python scripts/stage_h2r_policy.py --checkpoint <ckpt>/pretrained_model \
+    --type h2r_pi0 --out outputs/staged/<name>     # hard-links weights; ~28 KB, not 22 GB
+CONFIG=configs/kitting.env PRETRAINED=outputs/staged/<name> \
+    OBJECT_POSE=outputs/object_pose/kitting/head/store ./scripts/ft_pi0.sh
+```
+
+`scripts/test_object_pose_head.py` covers the parts that fail quietly — target survival through
+the processor pipeline, masking, the all-invalid batch, gradient reaching the trunk, and the
+standardisation — without needing a GPU or model weights.
+
+Still open: no training run has used these yet, so the heads are verified structurally rather
+than empirically.
 
 ### Phase 3 — experiments
 

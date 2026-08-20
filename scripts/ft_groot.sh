@@ -79,9 +79,27 @@ else
     TRAIN=(uv run --no-sync python "${ENTRY[@]}")
 fi
 
+# Attaching the target puts it in the batch; something has to consume it. With
+# OBJECT_POSE set we therefore train the h2r_groot variant -- GR00T plus an
+# object-pose head on the backbone -- rather than stock groot, which would carry
+# the target through the batch and ignore it. OBJECT_POSE_HEAD=0 opts out, for
+# checking the plumbing without the head.
+POLICY_TYPE=groot
+if [[ -n "$OBJECT_POSE" && "${OBJECT_POSE_HEAD:-1}" != "0" ]]; then
+    POLICY_TYPE=h2r_groot
+    # The store is passed twice on purpose and they mean different things: the env
+    # var attaches the per-sample target, this one standardises it in the head.
+    EXTRA_ARGS+=(--policy.object_pose_store="$OBJECT_POSE")
+    EXTRA_ARGS+=(--policy.object_pose_weight="${OBJECT_POSE_WEIGHT:-1.0}")
+    EXTRA_ARGS+=(--policy.object_pose_target="${OBJECT_POSE_TARGET:-position}")
+    if [[ "${OBJECT_POSE_DETACH:-0}" != "0" ]]; then
+        EXTRA_ARGS+=(--policy.object_pose_detach=true)
+    fi
+fi
+
 exec "${TRAIN[@]}" \
     --dataset.repo_id="$DATASET" \
-    --policy.type=groot \
+    --policy.type="$POLICY_TYPE" \
     --policy.base_model_path="$BASE_MODEL" \
     --policy.embodiment_tag="$EMBODIMENT_TAG" \
     --policy.device=cuda \

@@ -71,6 +71,33 @@ else
     TRAIN=(uv run --no-sync python "${ENTRY[@]}")
 fi
 
+# pi0 loads its weights through --policy.path, and LeRobot takes the policy class
+# from that checkpoint's config.json `type` (it pops the field before applying CLI
+# overrides), so --policy.type cannot switch it to h2r_pi0. Re-stage the checkpoint
+# once instead -- scripts/stage_h2r_policy.py hard-links the weights and rewrites
+# only the type -- and point PRETRAINED at the staged directory.
+if [[ -n "$OBJECT_POSE" && "${OBJECT_POSE_HEAD:-1}" != "0" ]]; then
+    STAGED_TYPE=$(python - "$PRETRAINED/config.json" <<'PY' 2>/dev/null || true
+import json, sys
+print(json.load(open(sys.argv[1])).get("type", ""))
+PY
+)
+    if [[ "$STAGED_TYPE" != "h2r_pi0" ]]; then
+        echo "OBJECT_POSE is set, but $PRETRAINED has type '${STAGED_TYPE:-unknown}', not h2r_pi0." >&2
+        echo "Stage it once, then point PRETRAINED at the result:" >&2
+        echo "    python scripts/stage_h2r_policy.py --checkpoint $PRETRAINED \\" >&2
+        echo "        --type h2r_pi0 --out <staged-dir>" >&2
+        echo "(or set OBJECT_POSE_HEAD=0 to attach the target without a head)" >&2
+        exit 1
+    fi
+    EXTRA_ARGS+=(--policy.object_pose_store="$OBJECT_POSE")
+    EXTRA_ARGS+=(--policy.object_pose_weight="${OBJECT_POSE_WEIGHT:-1.0}")
+    EXTRA_ARGS+=(--policy.object_pose_target="${OBJECT_POSE_TARGET:-position}")
+    if [[ "${OBJECT_POSE_DETACH:-0}" != "0" ]]; then
+        EXTRA_ARGS+=(--policy.object_pose_detach=true)
+    fi
+fi
+
 exec "${TRAIN[@]}" \
     --dataset.repo_id="$DATASET" \
     --policy.path="$PRETRAINED" \

@@ -25,6 +25,12 @@ is on and the action space contains Euler angles.
 per-frame pose target to every sample (see :mod:`h2r_il.object_pose_inject`).
 All the perception ran up front, so this is a lookup by the frame index each
 sample already carries; the dataset on disk is untouched here too.
+
+Attaching the target only puts it in the batch. Something has to *consume* it:
+that is ``--policy.type=h2r_pi0`` or ``h2r_groot`` (see :mod:`h2r_il.policies`),
+which are pi0 and GR00T with an object-pose head on the backbone. Set the store on
+both sides -- ``H2R_OBJECT_POSE`` so the target is attached, and
+``--policy.object_pose_store`` so the head standardises against the same numbers.
 """
 
 from __future__ import annotations
@@ -66,7 +72,18 @@ def _install_inpainting() -> None:
     _lr_train.make_train_eval_datasets = _patched
 
 
+def _register_policies() -> None:
+    """Make the h2r `--policy.type` values resolvable.
+
+    Import for the side effect of registration, and do it before LeRobot parses
+    its arguments. Config modules only -- the modeling modules are imported by
+    LeRobot's plugin path when a policy is built.
+    """
+    import h2r_il.policies  # noqa: F401
+
+
 def main() -> None:
+    _register_policies()
     _install_inpainting()
     # After inpainting, so the pose wrapper decorates the already-patched factory
     # and both hooks compose rather than one replacing the other.
